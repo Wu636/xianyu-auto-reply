@@ -1,0 +1,36 @@
+services:
+  xianyu-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xianyu-auto-reply-server
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:8090:8090"
+    volumes:
+      - xianyu_data:/app/data
+      - xianyu_logs:/app/logs
+      - xianyu_uploads:/app/static/uploads
+      - ./global_config.yml:/app/global_config.yml:ro
+    environment:
+      TZ: Asia/Shanghai
+      API_HOST: 0.0.0.0
+      API_PORT: 8090
+      DB_PATH: /app/data/xianyu_data.db
+      XIANYU_DATA_DIR: /app/data
+      USE_XVFB: "true"
+      ENABLE_HEADFUL: "true"
+      ENABLE_VNC: "false"
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:?请在 .env 中设置稳定的 SECRET_ENCRYPTION_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?请在 .env 中设置稳定的 JWT_SECRET_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+volumes:
+  xianyu_data:
+  xianyu_logs:
+  xianyu_uploads:

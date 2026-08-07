@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -200,24 +201,182 @@ class ItemPublisher:
     def _normalize_category_result(cls, category_result: Dict[str, Any]) -> Dict[str, str]:
         return {
             "catId": str(cls._first_present_value(category_result, "catId", "cat_id") or "").strip(),
-            "catName": str(cls._first_present_value(category_result, "catName", "cat_name") or "").strip(),
-            "channelCatId": str(cls._first_present_value(category_result, "channelCatId", "channel_cat_id") or "").strip(),
+            "catName": str(
+                cls._first_present_value(
+                    category_result,
+                    "catName",
+                    "cat_name",
+                    "channelCatName",
+                    "channel_cat_name",
+                    "channelCateName",
+                ) or ""
+            ).strip(),
+            "channelCatId": str(
+                cls._first_present_value(
+                    category_result,
+                    "channelCatId",
+                    "channel_cat_id",
+                    "channelCateId",
+                ) or ""
+            ).strip(),
             "tbCatId": str(cls._first_present_value(category_result, "tbCatId", "tb_cat_id") or "").strip(),
         }
+
+    @staticmethod
+    def _is_selected_category_value(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value == 1
+        return str(value or "").strip().lower() in {"1", "true", "yes", "selected"}
+
+    @classmethod
+    def _extract_category_candidates(cls, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        card_list = data.get("cardList") if isinstance(data, dict) else []
+        for card_index, card in enumerate(card_list or []):
+            card_data = card.get("cardData") if isinstance(card, dict) else None
+            if not isinstance(card_data, dict):
+                continue
+
+            property_name = str(card_data.get("propertyName") or "")
+            looks_like_category_card = any(keyword in property_name for keyword in ("类目", "分类", "品类"))
+            for value_index, value in enumerate(card_data.get("valuesList") or []):
+                if not isinstance(value, dict):
+                    continue
+
+                merged_value = dict(value)
+                transport_data = value.get("transportData")
+                if isinstance(transport_data, dict):
+                    for key, aliases in {
+                        "catName": ("catName", "channelCatName", "channelCateName"),
+                        "channelCatId": ("channelCatId", "channelCateId"),
+                        "tbCatId": ("tbCatId",),
+                    }.items():
+                        if cls._first_present_value(merged_value, key):
+                            continue
+                        fallback = cls._first_present_value(transport_data, *aliases)
+                        if fallback not in (None, ""):
+                            merged_value[key] = fallback
+
+                normalized = cls._normalize_category_result(merged_value)
+                if not looks_like_category_card and not any(normalized.values()):
+                    continue
+
+                try:
+                    score = float(value.get("score") or 0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                selected = cls._is_selected_category_value(value.get("isClicked")) or cls._is_selected_category_value(
+                    value.get("isUserClick")
+                )
+                if isinstance(transport_data, dict):
+                    selected = selected or cls._is_selected_category_value(transport_data.get("isUserClick"))
+
+                candidates.append(
+                    {
+                        **normalized,
+                        "selected": selected,
+                        "score": score,
+                        "card_index": card_index,
+                        "value_index": value_index,
+                    }
+                )
+        return candidates
+
+    @staticmethod
+    def _is_complete_category(category_result: Dict[str, Any]) -> bool:
+        return all(str(category_result.get(field) or "").strip() for field in ("catId", "catName", "channelCatId", "tbCatId"))
+
+    @staticmethod
+    def _is_channel_category(category_result: Dict[str, Any]) -> bool:
+        """新版频道类目只返回 channelCatId + catName。
+
+        闲鱼近期把 AI 教学、AI 工具等类目迁移到了频道类目树，
+        这类结果没有旧版的 catId/tbCatId。它们仍是平台明确返回的
+        可发布类目，提交时应保留频道 ID，让平台完成最终校验。
+        """
+        return all(str(category_result.get(field) or "").strip() for field in ("catName", "channelCatId"))
 
     @classmethod
     def _validate_category_recommendation(cls, channel_res: Dict[str, Any]) -> Dict[str, str]:
         data = channel_res.get("data") if isinstance(channel_res, dict) else None
+        data = data if isinstance(data, dict) else {}
         category_result = cls._normalize_category_result(
-            data.get("categoryPredictResult", {}) if isinstance(data, dict) else {}
+            data.get("categoryPredictResult", {})
         )
-        missing_fields = [field for field, value in category_result.items() if not value]
-        if missing_fields:
-            raise ValueError(
-                "自动识别类目不完整，缺少字段: "
-                f"{', '.join(missing_fields)}。请调整商品标题、首图或填写类目提示后重试。"
+        if cls._is_complete_category(category_result):
+            return category_result
+
+        # 新版频道类目可能直接出现在主预测结果中，只有频道 ID 和名称。
+        # 先保留平台的原始选择，不再因为缺少旧版 tbCatId 而在本地拦截。
+        if cls._is_channel_category(category_result):
+            logger.info(
+                "闲鱼返回新版频道类目，按频道类目提交: "
+                f"{category_result.get('catName')} ({category_result.get('channelCatId')})"
             )
-        return category_result
+            return category_result
+
+        candidates = cls._extract_category_candidates(data)
+        selected_candidates = [candidate for candidate in candidates if candidate.get("selected")]
+        complete_selected = [candidate for candidate in selected_candidates if cls._is_complete_category(candidate)]
+        channel_selected = [candidate for candidate in selected_candidates if cls._is_channel_category(candidate)]
+
+        # categoryPredictResult 偶尔会为空，但闲鱼仍会在“分类”卡片中把实际选中的
+        # 完整类目返回。只采用明确标记为选中的候选，避免擅自改到另一个类目。
+        if complete_selected:
+            selected = max(complete_selected, key=lambda item: float(item.get("score") or 0))
+            resolved = {field: str(selected.get(field) or "").strip() for field in category_result}
+            logger.warning(
+                "闲鱼主类目预测为空或不完整，已采用平台明确选中的候选类目: "
+                f"{resolved.get('catName')} ({resolved.get('channelCatId')})"
+            )
+            return resolved
+
+        # AI 教学服务等新版类目通常只有 channelCatId/catName，且由平台在分类卡片
+        # 中标记 isClicked。优先使用这个明确选项，不拼接其他候选的旧版 ID。
+        if channel_selected:
+            selected = max(channel_selected, key=lambda item: float(item.get('score') or 0))
+            resolved = {field: str(selected.get(field) or "").strip() for field in category_result}
+            logger.info(
+                "闲鱼分类卡片已选新版频道类目，按频道类目提交: "
+                f"{resolved.get('catName')} ({resolved.get('channelCatId')})"
+            )
+            return resolved
+
+        # 主结果为部分字段时，只允许使用与这些字段完全一致的候选补齐，
+        # 防止把相邻候选的 ID 拼成一个不存在的类目路径。
+        present_prediction = {field: value for field, value in category_result.items() if value}
+        if present_prediction:
+            compatible_candidates = [
+                candidate
+                for candidate in candidates
+                if cls._is_complete_category(candidate)
+                and all(str(candidate.get(field) or "") == value for field, value in present_prediction.items())
+            ]
+            if len(compatible_candidates) == 1:
+                compatible = compatible_candidates[0]
+                return {field: str(compatible.get(field) or "").strip() for field in category_result}
+
+        missing_fields = [field for field, value in category_result.items() if not value]
+        candidate_summaries = []
+        for candidate in candidates[:5]:
+            name = candidate.get("catName") or "未命名类目"
+            candidate_missing = [
+                field for field in ("catId", "channelCatId", "tbCatId") if not candidate.get(field)
+            ]
+            suffix = "完整" if not candidate_missing else f"缺 {','.join(candidate_missing)}"
+            selected_mark = "，平台已选" if candidate.get("selected") else ""
+            candidate_summaries.append(f"{name}（{suffix}{selected_mark}）")
+
+        candidate_message = ""
+        if candidate_summaries:
+            candidate_message = f" 平台候选: {'、'.join(candidate_summaries)}。"
+        raise ValueError(
+            "自动识别类目不完整，缺少字段: "
+            f"{', '.join(missing_fields)}。{candidate_message}"
+            "系统不会用其他类目伪装发布；请填写真实、具体的商品类型，或调整标题和首图后重试。"
+        )
 
     @classmethod
     def _build_category_debug(cls, channel_res: Dict[str, Any], category_hint: Optional[str] = None) -> Dict[str, Any]:
@@ -309,12 +468,49 @@ class ItemPublisher:
         if not publish_desc:
             raise ValueError("商品描述不能为空")
 
-        channel_res = await self.get_public_channel(publish_title, publish_desc, uploaded_images, category_hint=category_hint)
-        if not self.is_success_response(channel_res):
-            raise RuntimeError(f"获取发布类目失败: {self.extract_error_message(channel_res)}")
+        cleaned_category_hint = str(category_hint or "").strip() or None
+        attempt_hints = [cleaned_category_hint, None if cleaned_category_hint else None]
+        channel_res: Dict[str, Any] = {}
+        category_result: Optional[Dict[str, str]] = None
+        category_errors: List[str] = []
+        successful_recommendation_seen = False
 
-        category_result = self._validate_category_recommendation(channel_res)
-        category_debug = self._build_category_debug(channel_res, category_hint=category_hint)
+        for attempt_index, attempt_hint in enumerate(attempt_hints):
+            if attempt_index:
+                # 类目推荐接口偶尔会返回 SUCCESS 但主结果为空。短暂等待后重试一次；
+                # 用户填写的提示词可能不是闲鱼真实类目，因此第二次自动去掉提示词。
+                await asyncio.sleep(0.45)
+            channel_res = await self.get_public_channel(
+                publish_title,
+                publish_desc,
+                uploaded_images,
+                category_hint=attempt_hint,
+            )
+            if not self.is_success_response(channel_res):
+                category_errors.append(f"获取发布类目失败: {self.extract_error_message(channel_res)}")
+                continue
+
+            successful_recommendation_seen = True
+            try:
+                category_result = self._validate_category_recommendation(channel_res)
+                break
+            except ValueError as exc:
+                category_errors.append(str(exc))
+                if attempt_index == 0:
+                    logger.warning(
+                        f"【{self.cookie_id}】闲鱼类目识别结果不完整，准备自动重试: {exc}"
+                    )
+
+        if category_result is None:
+            last_error = category_errors[-1] if category_errors else "闲鱼未返回类目识别结果"
+            retry_note = "已去除类目提示并自动重试一次" if cleaned_category_hint else "已自动重试一次"
+            if successful_recommendation_seen:
+                raise ValueError(f"{last_error}（{retry_note}）")
+            raise RuntimeError(f"{last_error}（{retry_note}）")
+
+        category_debug = self._build_category_debug(channel_res, category_hint=attempt_hint)
+        category_debug["requested_category_hint"] = cleaned_category_hint or ""
+        category_debug["recommendation_attempts"] = len(category_errors) + 1
 
         location = await self.get_default_location()
 
@@ -387,10 +583,13 @@ class ItemPublisher:
 
         headers = self._build_headers()
         headers.pop("content-type", None)
-        headers["accept"] = "*/*"
+        headers.update({
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "x-requested-with": "XMLHttpRequest",
+        })
         params = {
             "floderId": "0",
-            "appkey": "xy_chat",
+            "appkey": "fleamarket",
             "_input_charset": "utf-8",
         }
 
@@ -399,15 +598,45 @@ class ItemPublisher:
             params=params,
             data=form_data,
             headers=headers,
+            allow_redirects=False,
             **self._build_request_kwargs(),
         ) as response:
             self._update_cookies_from_response(response)
+            status = response.status
+            location = str(response.headers.get("Location") or "")
+            content_type = str(response.headers.get("Content-Type") or "").lower()
             response_text = await response.text()
+
+        if status in {301, 302, 303, 307, 308}:
+            if "login" in location.lower():
+                raise ValueError(
+                    "闲鱼图片上传登录态已失效（上传服务返回登录页）。"
+                    "请到账号管理重新登录该闲鱼账号，获取最新 Cookie 后再发布；"
+                    "浏览器里能查看闲鱼页面，不代表本系统保存的图片上传登录态仍有效。"
+                )
+            raise RuntimeError(f"闲鱼图片上传发生异常跳转（HTTP {status}），请稍后重试")
+
+        if status in {401, 403}:
+            raise ValueError(
+                f"闲鱼图片上传未授权（HTTP {status}）。请到账号管理重新登录该闲鱼账号后重试。"
+            )
+
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"闲鱼图片上传请求失败（HTTP {status}）")
+
+        response_prefix = response_text.lstrip().lower()
+        if "text/html" in content_type or response_prefix.startswith("<!doctype html") or response_prefix.startswith("<html"):
+            raise ValueError(
+                "闲鱼图片上传登录态已失效（上传服务返回登录页面）。"
+                "请到账号管理重新登录该闲鱼账号后重试。"
+            )
 
         try:
             payload = json.loads(response_text)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"图片上传返回异常响应: {response_text[:200]}") from exc
+            raise RuntimeError(
+                f"闲鱼图片上传返回了无法解析的数据（HTTP {status}，Content-Type: {content_type or '未知'}）"
+            ) from exc
 
         image_object = payload.get("object") or payload.get("data") or payload.get("result") or {}
         image_url = image_object.get("url") or payload.get("url")
@@ -545,7 +774,7 @@ class ItemPublisher:
                 "title": title,
                 "titleDescSeparate": description != title,
             },
-            "itemLabelExtList": self._build_item_label_list(card_list),
+            "itemLabelExtList": self._build_item_label_list(card_list, selected_category=category_result),
             "itemPriceDTO": {},
             "userRightsProtocols": [
                 {
@@ -643,17 +872,39 @@ class ItemPublisher:
             payload["defaultPrice"] = True
 
     @classmethod
-    def _build_item_label_list(cls, card_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _build_item_label_list(
+        cls,
+        card_list: List[Dict[str, Any]],
+        selected_category: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         labels: List[Dict[str, Any]] = []
         for card in card_list:
             card_data = card.get("cardData") or {}
             values_list = card_data.get("valuesList") or []
             selected_value = None
 
-            for value in values_list:
-                if value.get("isClicked"):
-                    selected_value = value
-                    break
+            selected_channel_cat_id = str((selected_category or {}).get("channelCatId") or "").strip()
+            if selected_channel_cat_id:
+                selected_value = next(
+                    (
+                        value for value in values_list
+                        if str(
+                            cls._first_present_value(
+                                value,
+                                "channelCatId",
+                                "channel_cat_id",
+                                "channelCateId",
+                            ) or ""
+                        ).strip() == selected_channel_cat_id
+                    ),
+                    None,
+                )
+
+            if selected_value is None:
+                for value in values_list:
+                    if cls._is_selected_category_value(value.get("isClicked")):
+                        selected_value = value
+                        break
 
             if selected_value is None:
                 property_name = str(card_data.get("propertyName") or "")

@@ -66,6 +66,7 @@
 }
 
 .item-publish-preview-card {
+  position: relative;
   overflow: hidden;
   border: 1px solid rgba(15, 23, 42, 0.08);
   border-radius: 16px;
@@ -98,6 +99,32 @@
   margin-top: 4px;
   font-size: 0.78rem;
   color: #64748b;
+}
+
+.item-publish-preview-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 1;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(79, 70, 229, 0.92);
+  font-size: 0.72rem;
+  font-weight: 700;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.2);
+}
+
+.item-publish-preview-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.item-publish-preview-actions .btn {
+  padding: 3px 5px;
+  line-height: 1.2;
 }
 
 .item-publish-preview-empty {

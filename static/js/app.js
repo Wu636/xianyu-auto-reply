@@ -43,8 +43,19 @@ let itemPublishSubmitting = false;
 let itemPublishSavingMaterial = false;
 let itemPublishLoadedMaterialId = null;
 let itemPublishLoadedMaterialImages = [];
+let itemPublishImageItems = [];
 let itemPublishMaterials = [];
 let itemPublishLogs = [];
+let aiProductCreating = false;
+let aiProductReferencePreviewUrls = [];
+let contentProductCreating = false;
+let quarkCatalogJobTimer = null;
+let quarkFolderPickerStack = [];
+let quarkCatalogPreviewState = null;
+const quarkCatalogSecretEditState = {
+    text_api_key: false,
+    image_api_key: false
+};
 
 // 订单列表搜索和分页相关变量
 let allOrdersData = []; // 存储所有订单数据
@@ -127,6 +138,10 @@ function showSection(sectionName) {
         break;
     case 'item-publish':    // 【商品发布菜单】
         loadItemPublish();
+        break;
+    case 'content-products':
+        loadContentProductAccounts();
+        loadContentProducts();
         break;
     case 'items':           // 【商品管理菜单】
         loadItems();
@@ -11029,8 +11044,10 @@ async function doRestartSystem() {
 async function loadItemPublish() {
     ensureItemPublishPageInitialized();
     handlePublishDeliveryChoiceChange();
+    await loadItemPublishAccounts();
     await Promise.all([
-        loadItemPublishAccounts(),
+        loadQuarkCatalogSettings(),
+        loadQuarkCatalogItems(),
         loadItemPublishMaterials(),
         loadItemPublishLogs()
     ]);
@@ -11096,10 +11113,1088 @@ async function loadItemPublishAccounts() {
         } else if (availableAccounts.length === 1) {
             select.value = availableAccounts[0].id;
         }
+
+        const linkedSelects = [
+            document.getElementById('quarkCatalogAccountId'),
+            document.getElementById('aiProductCreatorAccountId'),
+            document.getElementById('contentProductAccount')
+        ].filter(Boolean);
+        linkedSelects.forEach(linkedSelect => {
+            const linkedCurrent = linkedSelect.value;
+            linkedSelect.innerHTML = '<option value="">请选择账号</option>';
+            availableAccounts.forEach(account => {
+                const option = document.createElement('option');
+                option.value = account.id;
+                option.textContent = buildItemPublishAccountLabel(account);
+                linkedSelect.appendChild(option);
+            });
+            if (linkedCurrent && availableAccounts.some(account => account.id === linkedCurrent)) {
+                linkedSelect.value = linkedCurrent;
+            } else if (availableAccounts.length === 1) {
+                linkedSelect.value = availableAccounts[0].id;
+            }
+        });
     } catch (error) {
         console.error('加载发布账号失败:', error);
         select.innerHTML = '<option value="">加载账号失败</option>';
         showToast('加载发布账号失败', 'danger');
+    }
+}
+
+function syncAIProductCreatorAccount() {
+    const creatorSelect = document.getElementById('aiProductCreatorAccountId');
+    const publishSelect = document.getElementById('publishCookieId');
+    if (creatorSelect?.value && publishSelect) {
+        publishSelect.value = creatorSelect.value;
+    }
+}
+
+function clearAIProductReferencePreviews() {
+    aiProductReferencePreviewUrls.forEach(url => URL.revokeObjectURL(url));
+    aiProductReferencePreviewUrls = [];
+}
+
+function handleAIProductReferenceImagesChange() {
+    const input = document.getElementById('aiProductReferenceImages');
+    const container = document.getElementById('aiProductReferencePreviewList');
+    const files = Array.from(input?.files || []);
+    clearAIProductReferencePreviews();
+    if (!container) return;
+
+    if (files.length > 4) {
+        if (input) input.value = '';
+        container.innerHTML = '<div class="item-publish-preview-empty">参考图最多选择 4 张</div>';
+        showToast('参考图最多选择 4 张', 'warning');
+        return;
+    }
+    const invalidFile = files.find(file => (file.type && !file.type.startsWith('image/')) || file.size > 8 * 1024 * 1024);
+    if (invalidFile) {
+        if (input) input.value = '';
+        container.innerHTML = '<div class="item-publish-preview-empty">请选择不超过 8MB 的有效图片</div>';
+        showToast(`${invalidFile.name || '参考图'} 不是有效图片或超过 8MB`, 'warning');
+        return;
+    }
+    if (!files.length) {
+        container.innerHTML = '<div class="item-publish-preview-empty">尚未选择参考图</div>';
+        return;
+    }
+
+    container.innerHTML = files.map((file, index) => {
+        const url = URL.createObjectURL(file);
+        aiProductReferencePreviewUrls.push(url);
+        return `
+            <div class="item-publish-preview-card">
+                <img src="${escapeHtml(url)}" alt="参考图 ${index + 1}">
+                <div class="item-publish-preview-meta">
+                    <div class="item-publish-preview-name" title="${escapeHtml(file.name || '')}">${escapeHtml(file.name || `参考图 ${index + 1}`)}</div>
+                    <div class="item-publish-preview-size">${formatFileSize(file.size || 0)}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function setAIProductCreatorStatus(message, type = 'light') {
+    const status = document.getElementById('aiProductCreatorStatus');
+    if (!status) return;
+    status.className = `alert alert-${type} border mt-3 mb-0 small`;
+    status.textContent = message;
+}
+
+function clearAIProductCreator() {
+    ['aiProductBrief', 'aiProductCategoryHint', 'aiProductMarketQuery', 'aiProductPriceHint', 'aiProductOriginalPriceHint']
+        .forEach(id => {
+            const element = document.getElementById(id);
+            if (element) element.value = '';
+        });
+    const input = document.getElementById('aiProductReferenceImages');
+    if (input) input.value = '';
+    const marketSwitch = document.getElementById('aiProductMarketResearch');
+    if (marketSwitch) marketSwitch.checked = true;
+    const delivery = document.getElementById('aiProductDeliveryChoice');
+    if (delivery) delivery.value = '包邮';
+    clearAIProductReferencePreviews();
+    const preview = document.getElementById('aiProductReferencePreviewList');
+    if (preview) preview.innerHTML = '<div class="item-publish-preview-empty">尚未选择参考图</div>';
+    setAIProductCreatorStatus('等待输入商品需求');
+}
+
+async function generateAIProductDraft(publishAfter = false) {
+    if (aiProductCreating) return false;
+
+    const brief = document.getElementById('aiProductBrief')?.value.trim() || '';
+    const accountId = document.getElementById('aiProductCreatorAccountId')?.value || '';
+    const files = Array.from(document.getElementById('aiProductReferenceImages')?.files || []);
+    const priceHint = document.getElementById('aiProductPriceHint')?.value.trim() || '';
+    const originalPriceHint = document.getElementById('aiProductOriginalPriceHint')?.value.trim() || '';
+    if (brief.length < 4) {
+        showToast('请至少用 4 个字描述要上架的商品', 'warning');
+        return false;
+    }
+    if (publishAfter && !accountId) {
+        showToast('一键上架前请选择闲鱼账号', 'warning');
+        return false;
+    }
+    if (files.length > 4) {
+        showToast('参考图最多上传 4 张', 'warning');
+        return false;
+    }
+    if (originalPriceHint && !priceHint) {
+        showToast('填写原价时必须同时填写期望售价', 'warning');
+        return false;
+    }
+
+    const generateButton = document.getElementById('aiProductGenerateBtn');
+    const publishButton = document.getElementById('aiProductGeneratePublishBtn');
+    const originalGenerateHtml = generateButton?.innerHTML || '';
+    const originalPublishHtml = publishButton?.innerHTML || '';
+    aiProductCreating = true;
+    [generateButton, publishButton].forEach(button => { if (button) button.disabled = true; });
+    const activeButton = publishAfter ? publishButton : generateButton;
+    if (activeButton) {
+        activeButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>AI 生成中...';
+    }
+    setAIProductCreatorStatus('正在调研同款并生成标题、详情与封面，通常需要几十秒，请不要重复点击...', 'info');
+
+    try {
+        const referenceImages = await convertPublishFilesToImages(files);
+        const payload = {
+            description: brief,
+            reference_images: referenceImages,
+            account_id: accountId || null,
+            category_hint: document.getElementById('aiProductCategoryHint')?.value.trim() || null,
+            market_query: document.getElementById('aiProductMarketQuery')?.value.trim() || null,
+            market_research: Boolean(document.getElementById('aiProductMarketResearch')?.checked),
+            price_hint: parseOptionalPublishNumber(priceHint, '期望售价'),
+            original_price_hint: parseOptionalPublishNumber(originalPriceHint, '原价'),
+            delivery_method: document.getElementById('aiProductDeliveryChoice')?.value || '包邮'
+        };
+        const result = await requestItemPublishJson('/ai-product-creator/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const material = result.material;
+        if (!material?.id) {
+            throw new Error('AI 已返回结果，但商品素材保存失败');
+        }
+
+        if (accountId) {
+            const publishAccount = document.getElementById('publishCookieId');
+            if (publishAccount) publishAccount.value = accountId;
+        }
+        await loadItemPublishMaterials();
+        applyItemPublishMaterialToForm(material);
+
+        const warningText = Array.isArray(result.warnings) && result.warnings.length
+            ? `；提醒：${result.warnings.join('；')}`
+            : '';
+        const sampleCount = Number(result.market_research?.sample_count || 0);
+        const visionText = files.length
+            ? (result.reference_images_analyzed ? '参考图已用于理解商品' : '参考图未被当前文案模型识别，已保留为附图')
+            : '本次为纯文字生成';
+        setAIProductCreatorStatus(
+            `生成完成：${visionText}；同款样本 ${sampleCount} 个；${result.pricing_basis || '已生成建议价'}${warningText}`,
+            warningText ? 'warning' : 'success'
+        );
+
+        if (publishAfter) {
+            setAIProductCreatorStatus('商品素材已生成，正在使用所选账号一键上架...', 'info');
+            const published = await submitItemPublishForm();
+            setAIProductCreatorStatus(
+                published ? '生成并上架完成，请在右侧发布记录查看商品链接。' : '素材已生成，但上架失败；可在下方编辑后重试。',
+                published ? 'success' : 'warning'
+            );
+            return published;
+        }
+
+        showToast('AI 商品已生成，可在发布表单中修改后上架', 'success');
+        document.getElementById('itemPublishForm')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return true;
+    } catch (error) {
+        console.error('AI 商品创作失败:', error);
+        setAIProductCreatorStatus(error.message || 'AI 商品创作失败', 'danger');
+        showToast(error.message || 'AI 商品创作失败', 'danger');
+        return false;
+    } finally {
+        aiProductCreating = false;
+        [generateButton, publishButton].forEach(button => { if (button) button.disabled = false; });
+        if (generateButton) generateButton.innerHTML = originalGenerateHtml || '<i class="bi bi-stars me-1"></i>生成商品素材';
+        if (publishButton) publishButton.innerHTML = originalPublishHtml || '<i class="bi bi-cloud-upload me-1"></i>生成并一键上架';
+    }
+}
+
+function setContentProductStatus(message, type = 'light') {
+    const element = document.getElementById('contentProductStatus');
+    if (!element) return;
+    element.className = `alert alert-${type} border mt-3 mb-0 small`;
+    element.textContent = message;
+}
+
+async function loadContentProductAccounts() {
+    const select = document.getElementById('contentProductAccount');
+    if (!select) return;
+    try {
+        const response = await fetch(`${apiBase}/cookies`, { headers: { 'Authorization': `Bearer ${getAuthToken()}` } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || '账号加载失败');
+        const accounts = Array.isArray(data.cookies) ? data.cookies : (Array.isArray(data) ? data : []);
+        const current = select.value;
+        select.innerHTML = '<option value="">仅生成，不发布</option>' + accounts.map(account => {
+            const id = account.id || account.cookie_id || '';
+            const label = account.remark || account.username || id;
+            return `<option value="${escapeHtml(String(id))}">${escapeHtml(String(label))}</option>`;
+        }).join('');
+        if (current) select.value = current;
+    } catch (error) {
+        console.warn('内容商品账号加载失败:', error);
+    }
+}
+
+function clearContentProductForm() {
+    ['contentProductSourceUrl', 'contentProductSourceText', 'contentProductCategory', 'contentProductPrice', 'contentProductOriginalPrice', 'contentProductDeliveryText']
+        .forEach(id => { const element = document.getElementById(id); if (element) element.value = ''; });
+    const mode = document.getElementById('contentProductOutputMode');
+    if (mode) mode.value = 'bundle';
+    const rights = document.getElementById('contentProductRightsStatus');
+    if (rights) rights.value = 'reference_only';
+    const research = document.getElementById('contentProductMarketResearch');
+    if (research) research.checked = true;
+    const account = document.getElementById('contentProductAccount');
+    if (account) account.value = '';
+    setContentProductStatus('等待输入链接或正文');
+}
+
+async function generateContentProduct(publishAfter = false) {
+    if (contentProductCreating) return false;
+    const sourceUrl = document.getElementById('contentProductSourceUrl')?.value.trim() || '';
+    const sourceText = document.getElementById('contentProductSourceText')?.value.trim() || '';
+    const accountId = document.getElementById('contentProductAccount')?.value || '';
+    const rightsStatus = document.getElementById('contentProductRightsStatus')?.value || 'reference_only';
+    if (!sourceUrl && sourceText.length < 80) {
+        showToast('请提供文章链接，或粘贴至少 80 个字的正文', 'warning');
+        return false;
+    }
+    if (publishAfter && (!accountId || rightsStatus === 'reference_only')) {
+        showToast('一键上架需要选择账号，并先确认来源状态', 'warning');
+        return false;
+    }
+    const generateButton = document.getElementById('contentProductGenerateBtn');
+    const publishButton = document.getElementById('contentProductGeneratePublishBtn');
+    const originals = [generateButton?.innerHTML || '', publishButton?.innerHTML || ''];
+    contentProductCreating = true;
+    [generateButton, publishButton].forEach(button => { if (button) button.disabled = true; });
+    const active = publishAfter ? publishButton : generateButton;
+    if (active) active.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>整理中...';
+    setContentProductStatus('正在抓取/整理正文，生成标题、详情、封面和内容包，通常需要几十秒...', 'info');
+    try {
+        const result = await requestItemPublishJson('/content-products/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                source_url: sourceUrl || null,
+                source_text: sourceText || null,
+                output_mode: document.getElementById('contentProductOutputMode')?.value || 'bundle',
+                rights_status: rightsStatus,
+                category_hint: document.getElementById('contentProductCategory')?.value.trim() || null,
+                market_research: Boolean(document.getElementById('contentProductMarketResearch')?.checked),
+                price_hint: parseOptionalPublishNumber(document.getElementById('contentProductPrice')?.value, '期望售价'),
+                original_price_hint: parseOptionalPublishNumber(document.getElementById('contentProductOriginalPrice')?.value, '原价'),
+                delivery_method: document.getElementById('contentProductDelivery')?.value || '无需邮寄',
+                delivery_text: document.getElementById('contentProductDeliveryText')?.value.trim() || null,
+                account_id: accountId || null,
+                publish_after_review: Boolean(publishAfter)
+            })
+        });
+        const product = result.product || {};
+        if (product.material) {
+            await loadItemPublishMaterials();
+            applyItemPublishMaterialToForm(product.material);
+        }
+        await loadContentProducts();
+        const warning = Array.isArray(result.warnings) && result.warnings.length ? `；提醒：${result.warnings.join('；')}` : '';
+        setContentProductStatus(
+            publishAfter ? `内容包已生成并提交上架${warning}` : `生成完成，可下载 ${product.download_url ? 'ZIP' : '内容包'}，商品素材也已载入发布表单${warning}`,
+            warning ? 'warning' : 'success'
+        );
+        if (!publishAfter) showToast('内容商品已生成，可编辑后发布', 'success');
+        return true;
+    } catch (error) {
+        console.error('链接商品化失败:', error);
+        setContentProductStatus(error.message || '链接商品化失败', 'danger');
+        showToast(error.message || '链接商品化失败', 'danger');
+        return false;
+    } finally {
+        contentProductCreating = false;
+        [generateButton, publishButton].forEach(button => { if (button) button.disabled = false; });
+        if (generateButton) generateButton.innerHTML = originals[0] || '<i class="bi bi-stars me-1"></i>生成内容包';
+        if (publishButton) publishButton.innerHTML = originals[1] || '<i class="bi bi-cloud-upload me-1"></i>生成并上架';
+    }
+}
+
+async function loadContentProducts() {
+    const container = document.getElementById('contentProductList');
+    if (!container) return;
+    try {
+        const result = await requestItemPublishJson('/content-products?page=1&page_size=50');
+        const items = result.items || [];
+        if (!items.length) {
+            container.innerHTML = '<div class="text-muted small">暂无生成记录</div>';
+            return;
+        }
+        const statusText = { ready: '待编辑', review_required: '待确认来源', published: '已上架', packaging: '打包中', failed: '失败' };
+        container.innerHTML = `<table class="table table-sm align-middle"><thead><tr><th>来源</th><th>商品标题</th><th>形式</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>${items.map(item => `
+            <tr>
+              <td><div class="fw-semibold">${escapeHtml(item.source_title || '未命名来源')}</div><div class="text-muted small text-truncate" style="max-width:220px">${escapeHtml(item.source_url || '粘贴正文')}</div></td>
+              <td>${escapeHtml(item.title || '-')}</td>
+              <td>${escapeHtml(item.output_mode || 'bundle')}</td>
+              <td><span class="badge text-bg-${item.status === 'failed' ? 'danger' : 'success'}">${escapeHtml(statusText[item.status] || item.status || '-')}</span></td>
+              <td class="small">${escapeHtml(item.updated_at || item.created_at || '-')}</td>
+              <td class="text-nowrap">
+                ${item.download_url ? `<a class="btn btn-sm btn-outline-primary me-1" href="${escapeHtml(item.download_url)}" target="_blank"><i class="bi bi-download"></i></a>` : ''}
+                <button class="btn btn-sm btn-outline-secondary me-1" onclick="loadContentProductIntoPublish(${Number(item.id)})"><i class="bi bi-pencil"></i></button>
+                <button class="btn btn-sm btn-outline-danger" onclick="deleteContentProduct(${Number(item.id)})"><i class="bi bi-trash"></i></button>
+              </td>
+            </tr>`).join('')}</tbody></table>`;
+    } catch (error) {
+        container.innerHTML = `<div class="text-danger small">${escapeHtml(error.message || '加载失败')}</div>`;
+    }
+}
+
+async function loadContentProductIntoPublish(productId) {
+    try {
+        const result = await requestItemPublishJson(`/content-products/${encodeURIComponent(productId)}`);
+        if (!result.product?.material) throw new Error('该内容商品还没有可编辑素材');
+        await loadItemPublishMaterials();
+        applyItemPublishMaterialToForm(result.product.material);
+        showSection('item-publish');
+        document.getElementById('itemPublishForm')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        showToast('已载入发布表单，可修改后上架', 'success');
+    } catch (error) {
+        showToast(error.message || '载入内容商品失败', 'danger');
+    }
+}
+
+async function deleteContentProduct(productId) {
+    if (!confirm('确定删除这条内容商品记录及本地 ZIP 包吗？')) return;
+    try {
+        await requestItemPublishJson(`/content-products/${encodeURIComponent(productId)}`, { method: 'DELETE' });
+        await loadContentProducts();
+        showToast('内容商品已删除', 'success');
+    } catch (error) {
+        showToast(error.message || '删除失败', 'danger');
+    }
+}
+
+function ensureQuarkFolderPickerModal() {
+    let modal = document.getElementById('quarkFolderPickerModal');
+    if (modal) return modal;
+
+    modal = document.createElement('div');
+    modal.className = 'modal fade';
+    modal.id = 'quarkFolderPickerModal';
+    modal.tabIndex = -1;
+    modal.innerHTML = `
+        <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+          <div class="modal-content">
+            <div class="modal-header">
+              <div>
+                <h5 class="modal-title"><i class="bi bi-folder2-open me-2"></i>选择夸克文件夹</h5>
+                <div class="small text-muted mt-1" id="quarkFolderPickerPath">根目录</div>
+              </div>
+              <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+              <div class="d-flex flex-wrap gap-2 mb-3">
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="quarkFolderPickerBack">
+                  <i class="bi bi-arrow-left me-1"></i>返回上级
+                </button>
+                <button type="button" class="btn btn-sm btn-primary" id="quarkFolderPickerSelectCurrent">
+                  <i class="bi bi-check2-circle me-1"></i>选择当前目录
+                </button>
+              </div>
+              <div class="list-group" id="quarkFolderPickerList"></div>
+            </div>
+          </div>
+        </div>`;
+    document.body.appendChild(modal);
+    modal.querySelector('#quarkFolderPickerBack').addEventListener('click', goBackQuarkFolderPicker);
+    modal.querySelector('#quarkFolderPickerSelectCurrent').addEventListener('click', () => {
+        const current = quarkFolderPickerStack[quarkFolderPickerStack.length - 1];
+        if (current) selectQuarkCatalogFolder(current.fid, current.name);
+    });
+    return modal;
+}
+
+function handleQuarkRootFidInput() {
+    const fid = document.getElementById('quarkCatalogRootFid')?.value.trim() || '0';
+    const name = fid === '0' ? '根目录' : '手动输入的目录';
+    const nameInput = document.getElementById('quarkCatalogRootName');
+    const label = document.getElementById('quarkCatalogRootLabel');
+    if (nameInput) nameInput.value = name;
+    if (label) label.textContent = `当前选择：${name}`;
+}
+
+async function openQuarkFolderPicker() {
+    const modal = ensureQuarkFolderPickerModal();
+    quarkFolderPickerStack = [{ fid: '0', name: '根目录' }];
+    if (!modal._quarkModalInstance) modal._quarkModalInstance = new bootstrap.Modal(modal);
+    modal._quarkModalInstance.show();
+    await loadQuarkFolderPickerLevel();
+}
+
+async function loadQuarkFolderPickerLevel() {
+    const modal = ensureQuarkFolderPickerModal();
+    const list = modal.querySelector('#quarkFolderPickerList');
+    const path = modal.querySelector('#quarkFolderPickerPath');
+    const back = modal.querySelector('#quarkFolderPickerBack');
+    const selectCurrent = modal.querySelector('#quarkFolderPickerSelectCurrent');
+    const current = quarkFolderPickerStack[quarkFolderPickerStack.length - 1] || { fid: '0', name: '根目录' };
+    path.textContent = quarkFolderPickerStack.map(item => item.name).join(' / ');
+    back.disabled = quarkFolderPickerStack.length <= 1;
+    selectCurrent.disabled = current.fid === '0' && document.getElementById('quarkCatalogScope')?.value === 'selected_folder';
+    list.replaceChildren();
+    const loading = document.createElement('div');
+    loading.className = 'list-group-item text-muted';
+    loading.textContent = '正在读取目录…';
+    list.appendChild(loading);
+
+    try {
+        const data = await requestItemPublishJson('/quark-catalog/folders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                parent_fid: current.fid,
+                quark_cookie: document.getElementById('quarkCatalogCookie')?.value.trim() || null
+            })
+        });
+        list.replaceChildren();
+        const folders = data.folders || [];
+        if (!folders.length) {
+            const empty = document.createElement('div');
+            empty.className = 'list-group-item text-muted';
+            empty.textContent = '当前目录没有下级文件夹；仍可选择当前目录作为一个商品。';
+            list.appendChild(empty);
+            return;
+        }
+        folders.forEach(folder => {
+            const row = document.createElement('div');
+            row.className = 'list-group-item d-flex align-items-center justify-content-between gap-3';
+
+            const info = document.createElement('div');
+            info.className = 'min-w-0';
+            const title = document.createElement('div');
+            title.className = 'fw-semibold text-break';
+            title.textContent = folder.name;
+            const meta = document.createElement('div');
+            meta.className = 'small text-muted';
+            meta.textContent = `包含约 ${Number(folder.include_items || 0)} 项`;
+            info.append(title, meta);
+
+            const actions = document.createElement('div');
+            actions.className = 'd-flex flex-shrink-0 gap-2';
+            const choose = document.createElement('button');
+            choose.type = 'button';
+            choose.className = 'btn btn-sm btn-outline-success';
+            choose.textContent = '选择';
+            choose.addEventListener('click', () => selectQuarkCatalogFolder(folder.fid, folder.name));
+            const enter = document.createElement('button');
+            enter.type = 'button';
+            enter.className = 'btn btn-sm btn-outline-primary';
+            enter.textContent = '进入';
+            enter.addEventListener('click', async () => {
+                quarkFolderPickerStack.push({ fid: folder.fid, name: folder.name });
+                await loadQuarkFolderPickerLevel();
+            });
+            actions.append(choose, enter);
+            row.append(info, actions);
+            list.appendChild(row);
+        });
+    } catch (error) {
+        list.replaceChildren();
+        const failed = document.createElement('div');
+        failed.className = 'list-group-item text-danger';
+        failed.textContent = error.message || '读取夸克目录失败';
+        list.appendChild(failed);
+    }
+}
+
+async function goBackQuarkFolderPicker() {
+    if (quarkFolderPickerStack.length <= 1) return;
+    quarkFolderPickerStack.pop();
+    await loadQuarkFolderPickerLevel();
+}
+
+function selectQuarkCatalogFolder(fid, name) {
+    if (String(fid) === '0' && document.getElementById('quarkCatalogScope')?.value === 'selected_folder') {
+        showToast('根目录不能作为单个商品，请选择一个具体文件夹', 'warning');
+        return;
+    }
+    document.getElementById('quarkCatalogRootFid').value = String(fid || '0');
+    document.getElementById('quarkCatalogRootName').value = String(name || '所选夸克文件夹');
+    document.getElementById('quarkCatalogRootLabel').textContent = `当前选择：${name || '所选夸克文件夹'}`;
+    const modal = document.getElementById('quarkFolderPickerModal');
+    if (modal?._quarkModalInstance) modal._quarkModalInstance.hide();
+}
+
+function setQuarkCatalogStatus(message, type = 'light') {
+    const element = document.getElementById('quarkCatalogStatus');
+    if (!element) return;
+    element.className = `alert alert-${type} border mt-3 mb-0 small`;
+    element.textContent = message;
+}
+
+const QUARK_CATALOG_SECRET_FIELDS = {
+    text_api_key: {
+        inputId: 'quarkTextApiKey',
+        buttonId: 'quarkTextApiKeyEditButton',
+        stateId: 'quarkTextApiKeyState',
+        configuredField: 'text_api_key_configured',
+        hintField: 'text_api_key_hint',
+        label: '文案 API Key'
+    },
+    image_api_key: {
+        inputId: 'quarkImageApiKey',
+        buttonId: 'quarkImageApiKeyEditButton',
+        stateId: 'quarkImageApiKeyState',
+        configuredField: 'image_api_key_configured',
+        hintField: 'image_api_key_hint',
+        label: '生图 API Key'
+    }
+};
+
+function enableQuarkCatalogSecretEdit(field) {
+    const config = QUARK_CATALOG_SECRET_FIELDS[field];
+    if (!config) return;
+    const input = document.getElementById(config.inputId);
+    const button = document.getElementById(config.buttonId);
+    const state = document.getElementById(config.stateId);
+    if (!input) return;
+
+    quarkCatalogSecretEditState[field] = true;
+    input.readOnly = false;
+    input.value = '';
+    input.placeholder = `请输入新的${config.label}`;
+    if (button) {
+        button.textContent = '编辑中';
+        button.classList.remove('btn-outline-primary');
+        button.classList.add('btn-warning');
+    }
+    if (state) state.textContent = '请输入新 Key，点击“保存配置”后加密保存；未保存前不会替换旧值。';
+    window.setTimeout(() => input.focus(), 0);
+}
+
+function lockQuarkCatalogSecretField(field, settings = {}) {
+    const config = QUARK_CATALOG_SECRET_FIELDS[field];
+    if (!config) return;
+    const input = document.getElementById(config.inputId);
+    const button = document.getElementById(config.buttonId);
+    const state = document.getElementById(config.stateId);
+    const configured = Boolean(settings[config.configuredField]);
+    const hint = String(settings[config.hintField] || '').trim();
+
+    quarkCatalogSecretEditState[field] = false;
+    if (input) {
+        input.value = '';
+        input.readOnly = true;
+        input.placeholder = configured ? '已保存的 Key 不会显示' : `点击“修改”输入${config.label}`;
+    }
+    if (button) {
+        button.textContent = configured ? '更换' : '设置';
+        button.classList.remove('btn-warning');
+        button.classList.add('btn-outline-primary');
+    }
+    if (state) {
+        if (configured) {
+            state.textContent = `已加密保存${hint ? `（${hint}）` : ''}；刷新或重启后继续使用，无需重新输入。`;
+        } else if (field === 'image_api_key') {
+            state.textContent = '尚未单独配置；首次保存时可留空复用文案 Key。';
+        } else {
+            state.textContent = '尚未配置。';
+        }
+    }
+}
+
+function getEditedQuarkCatalogSecret(field) {
+    const config = QUARK_CATALOG_SECRET_FIELDS[field];
+    if (!config || !quarkCatalogSecretEditState[field]) {
+        return '';
+    }
+
+    const value = document.getElementById(config.inputId)?.value.trim() || '';
+    if (!value) {
+        throw new Error(`请输入新的${config.label}，或刷新页面取消更换`);
+    }
+    return value;
+}
+
+async function loadQuarkCatalogSettings() {
+    if (!document.getElementById('quarkCatalogPanel')) return;
+    try {
+        const data = await requestItemPublishJson('/quark-catalog/settings');
+        const settings = data.settings || {};
+        const setValue = (id, value) => {
+            const element = document.getElementById(id);
+            if (element && value !== undefined && value !== null) element.value = value;
+        };
+        setValue('quarkCatalogAccountId', settings.account_id || '');
+        setValue('quarkCatalogRootFid', settings.root_fid || '0');
+        setValue('quarkCatalogRootName', settings.root_folder_name || (settings.root_fid === '0' ? '根目录' : '所选夸克文件夹'));
+        setValue('quarkCatalogScope', settings.catalog_scope || 'child_folders');
+        setValue('quarkCatalogMaxItems', settings.max_items_per_run || 5);
+        setValue('quarkTextBaseUrl', settings.text_base_url || 'https://api.openai.com/v1');
+        setValue('quarkTextModel', settings.text_model || 'gpt-5-mini');
+        setValue('quarkImageBaseUrl', settings.image_base_url || 'https://api.openai.com/v1');
+        setValue('quarkImageModel', settings.image_model || 'gpt-image-1');
+        setValue('quarkCatalogPrice', settings.default_price ?? '');
+        setValue('quarkCatalogOriginalPrice', settings.default_original_price ?? '');
+        setValue('quarkCatalogCategory', settings.category_hint || '');
+        setValue('quarkCatalogCopyBackground', settings.copy_background || '');
+        setValue('quarkCatalogRunHour', settings.run_hour ?? 8);
+        setValue('quarkMarketSampleSize', settings.market_sample_size ?? 12);
+        setValue('quarkPricingStrategy', settings.pricing_strategy || 'competitive');
+        setValue('quarkTrafficPrice', settings.traffic_price ?? 0.1);
+        const rootLabel = document.getElementById('quarkCatalogRootLabel');
+        if (rootLabel) rootLabel.textContent = `当前选择：${settings.root_folder_name || (settings.root_fid === '0' ? '根目录' : '所选夸克文件夹')}`;
+        document.getElementById('quarkCatalogAutoPublish').checked = Boolean(settings.auto_publish);
+        document.getElementById('quarkCatalogScheduleEnabled').checked = Boolean(settings.schedule_enabled);
+        document.getElementById('quarkMarketResearchEnabled').checked = settings.market_research_enabled !== false;
+        const cookieState = document.getElementById('quarkCatalogCookieState');
+        if (cookieState) {
+            cookieState.textContent = settings.quark_cookie_configured
+                ? 'Cookie 已加密保存；留空即可保留原值'
+                : '尚未配置 Cookie';
+        }
+        lockQuarkCatalogSecretField('text_api_key', settings);
+        lockQuarkCatalogSecretField('image_api_key', settings);
+    } catch (error) {
+        console.error('加载夸克自动上架配置失败:', error);
+        setQuarkCatalogStatus(error.message || '加载配置失败', 'danger');
+    }
+}
+
+function getQuarkCatalogSettingsForm() {
+    return {
+        account_id: document.getElementById('quarkCatalogAccountId')?.value || '',
+        quark_cookie: document.getElementById('quarkCatalogCookie')?.value.trim() || '',
+        root_fid: document.getElementById('quarkCatalogRootFid')?.value.trim() || '0',
+        root_folder_name: document.getElementById('quarkCatalogRootName')?.value.trim() || '根目录',
+        catalog_scope: document.getElementById('quarkCatalogScope')?.value || 'child_folders',
+        text_base_url: document.getElementById('quarkTextBaseUrl')?.value.trim() || '',
+        text_api_key: getEditedQuarkCatalogSecret('text_api_key'),
+        text_model: document.getElementById('quarkTextModel')?.value.trim() || '',
+        image_base_url: document.getElementById('quarkImageBaseUrl')?.value.trim() || '',
+        image_api_key: getEditedQuarkCatalogSecret('image_api_key'),
+        image_model: document.getElementById('quarkImageModel')?.value.trim() || '',
+        default_price: parseOptionalPublishNumber(document.getElementById('quarkCatalogPrice')?.value, '默认售价'),
+        default_original_price: parseOptionalPublishNumber(document.getElementById('quarkCatalogOriginalPrice')?.value, '默认原价'),
+        category_hint: document.getElementById('quarkCatalogCategory')?.value.trim() || '',
+        copy_background: document.getElementById('quarkCatalogCopyBackground')?.value.trim() || '',
+        max_items_per_run: Number(document.getElementById('quarkCatalogMaxItems')?.value || 5),
+        market_research_enabled: Boolean(document.getElementById('quarkMarketResearchEnabled')?.checked),
+        market_sample_size: Number(document.getElementById('quarkMarketSampleSize')?.value || 12),
+        pricing_strategy: document.getElementById('quarkPricingStrategy')?.value || 'competitive',
+        traffic_price: parseOptionalPublishNumber(document.getElementById('quarkTrafficPrice')?.value, '拉新固定价'),
+        auto_publish: Boolean(document.getElementById('quarkCatalogAutoPublish')?.checked),
+        schedule_enabled: Boolean(document.getElementById('quarkCatalogScheduleEnabled')?.checked),
+        run_hour: Number(document.getElementById('quarkCatalogRunHour')?.value || 0),
+        random_delay_max: 10
+    };
+}
+
+async function saveQuarkCatalogSettings(showSuccess = true) {
+    try {
+        const payload = getQuarkCatalogSettingsForm();
+        const data = await requestItemPublishJson('/quark-catalog/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        document.getElementById('quarkCatalogCookie').value = '';
+        document.getElementById('quarkTextApiKey').value = '';
+        document.getElementById('quarkImageApiKey').value = '';
+        await loadQuarkCatalogSettings();
+        if (showSuccess) showToast(data.message || '夸克自动上架配置已保存', 'success');
+        return true;
+    } catch (error) {
+        console.error('保存夸克自动上架配置失败:', error);
+        showToast(error.message || '保存配置失败', 'danger');
+        return false;
+    }
+}
+
+async function testQuarkCatalogConnection() {
+    if (!await saveQuarkCatalogSettings(false)) return;
+    setQuarkCatalogStatus('正在测试夸克登录和目录读取...', 'info');
+    try {
+        const data = await requestItemPublishJson('/quark-catalog/test', { method: 'POST' });
+        const names = (data.folders || []).slice(0, 5).map(item => item.name).join('、');
+        setQuarkCatalogStatus(`${data.message}${names ? `；示例：${names}` : ''}`, 'success');
+        showToast(data.message || '夸克连接成功', 'success');
+    } catch (error) {
+        setQuarkCatalogStatus(error.message || '夸克连接失败', 'danger');
+        showToast(error.message || '夸克连接失败', 'danger');
+    }
+}
+
+async function startQuarkCatalogSync(publishNow, force = false) {
+    if (publishNow && !confirm('这会直接把生成的商品发布到闲鱼。确认继续吗？')) return;
+    if (force && !confirm('这会重新调用文案和生图接口，并覆盖所选目录中尚未发布的已有素材，但不会自动发布。确认继续吗？')) return;
+    if (!await saveQuarkCatalogSettings(false)) return;
+    setQuarkCatalogStatus(
+        publishNow ? '准备生成并发布...' : (force ? '准备重新生成已有素材...' : '准备生成素材...'),
+        'info'
+    );
+    try {
+        const data = await requestItemPublishJson('/quark-catalog/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ publish: Boolean(publishNow), force: Boolean(force) })
+        });
+        pollQuarkCatalogJob(data.job_id);
+    } catch (error) {
+        setQuarkCatalogStatus(error.message || '启动任务失败', 'danger');
+        showToast(error.message || '启动任务失败', 'danger');
+    }
+}
+
+async function pollQuarkCatalogJob(jobId) {
+    if (quarkCatalogJobTimer) clearTimeout(quarkCatalogJobTimer);
+    try {
+        const data = await requestItemPublishJson(`/quark-catalog/jobs/${encodeURIComponent(jobId)}`);
+        const job = data.job || {};
+        setQuarkCatalogStatus(`${job.stage || job.status || '处理中'}（${job.progress || 0}%）`, job.status === 'failed' ? 'danger' : 'info');
+        if (job.status === 'completed') {
+            const result = job.result || {};
+            setQuarkCatalogStatus(result.message || '同步完成', result.failed ? 'warning' : 'success');
+            showToast(result.message || '夸克目录同步完成', result.failed ? 'warning' : 'success');
+            await Promise.all([loadQuarkCatalogItems(), loadItemPublishMaterials(), loadItemPublishLogs()]);
+            return;
+        }
+        if (job.status === 'failed') {
+            setQuarkCatalogStatus(job.error || '任务失败', 'danger');
+            showToast(job.error || '夸克目录任务失败', 'danger');
+            return;
+        }
+        quarkCatalogJobTimer = setTimeout(() => pollQuarkCatalogJob(jobId), 2000);
+    } catch (error) {
+        setQuarkCatalogStatus(error.message || '读取任务状态失败', 'danger');
+    }
+}
+
+function ensureQuarkCatalogPreviewModal() {
+    let modal = document.getElementById('quarkCatalogPreviewModal');
+    if (modal) return modal;
+    modal = document.createElement('div');
+    modal.className = 'modal fade';
+    modal.id = 'quarkCatalogPreviewModal';
+    modal.tabIndex = -1;
+    modal.innerHTML = `
+        <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+          <div class="modal-content">
+            <div class="modal-header">
+              <div>
+                <h5 class="modal-title"><i class="bi bi-card-image me-2"></i>商品素材预览与编辑</h5>
+                <div class="small text-muted mt-1" id="quarkPreviewFolderName">正在加载…</div>
+              </div>
+              <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+              <div class="row g-4">
+                <div class="col-lg-5">
+                  <label class="form-label">商品封面图</label>
+                  <div id="quarkPreviewImages" class="item-publish-preview-list">
+                    <div class="item-publish-preview-empty">正在读取封面…</div>
+                  </div>
+                  <div class="form-text">可以根据你的要求重新生成首图；新图会先替换本地素材，不会自动发布。</div>
+                  <div class="mt-3">
+                    <label class="form-label" for="quarkPreviewCoverSuggestion">封面生成建议（可选）</label>
+                    <textarea class="form-control" id="quarkPreviewCoverSuggestion" rows="4" maxlength="1000" placeholder="例如：突出低价资料包和立即领取的感觉，使用橙黄色高对比配色，画面简洁，适合手机缩略图阅读"></textarea>
+                    <div class="form-text">可描述风格、配色、重点卖点、构图和希望避开的元素。</div>
+                  </div>
+                </div>
+                <div class="col-lg-7">
+                  <div class="mb-3">
+                    <label class="form-label" for="quarkPreviewTitle">商品标题</label>
+                    <input class="form-control" id="quarkPreviewTitle" maxlength="60">
+                  </div>
+                  <div class="mb-3">
+                    <label class="form-label" for="quarkPreviewDescription">商品详细介绍</label>
+                    <textarea class="form-control" id="quarkPreviewDescription" rows="8" maxlength="5000"></textarea>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-4">
+                      <label class="form-label" for="quarkPreviewPrice">现价</label>
+                      <div class="input-group"><span class="input-group-text">¥</span><input type="number" class="form-control" id="quarkPreviewPrice" min="0" step="0.01"></div>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label" for="quarkPreviewOriginalPrice">原价</label>
+                      <div class="input-group"><span class="input-group-text">¥</span><input type="number" class="form-control" id="quarkPreviewOriginalPrice" min="0" step="0.01"></div>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label" for="quarkPreviewCategory">类目提示</label>
+                      <input class="form-control" id="quarkPreviewCategory" maxlength="80">
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="alert alert-light border small mt-3 mb-0" id="quarkPreviewStatus">可修改后保存，保存不会自动发布。</div>
+            </div>
+            <div class="modal-footer">
+              <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">关闭</button>
+              <button type="button" class="btn btn-outline-success" id="quarkPreviewRegenerateBtn" onclick="regenerateQuarkCatalogCover()">
+                <i class="bi bi-magic me-1"></i>按建议重新生成封面
+              </button>
+              <button type="button" class="btn btn-outline-primary" id="quarkPreviewSaveBtn" onclick="saveQuarkCatalogPreview(false)">
+                <i class="bi bi-save me-1"></i>保存修改
+              </button>
+              <button type="button" class="btn btn-primary" id="quarkPreviewLoadBtn" onclick="saveQuarkCatalogPreview(true)">
+                <i class="bi bi-arrow-down-circle me-1"></i>保存并载入发布表单
+              </button>
+            </div>
+          </div>
+        </div>`;
+    document.body.appendChild(modal);
+    return modal;
+}
+
+function renderQuarkCatalogPreviewImages(images) {
+    const container = document.getElementById('quarkPreviewImages');
+    if (!container) return;
+    const safeImages = Array.isArray(images) ? images : [];
+    if (!safeImages.length) {
+        container.innerHTML = '<div class="item-publish-preview-empty">没有生成封面图</div>';
+        return;
+    }
+    container.innerHTML = safeImages.map((image, index) => {
+        const src = getItemPublishImageSrc(image);
+        const name = image?.filename || image?.name || `封面图 ${index + 1}`;
+        return `
+            <div class="item-publish-preview-card" style="width:100%;max-width:420px;">
+              <img src="${escapeHtml(src)}" alt="${escapeHtml(name)}" style="width:100%;height:auto;max-height:420px;object-fit:contain;">
+              <div class="item-publish-preview-meta"><div class="item-publish-preview-name">${escapeHtml(name)}</div></div>
+            </div>`;
+    }).join('');
+}
+
+async function openQuarkCatalogPreview(encodedQuarkFid) {
+    const quarkFid = decodeURIComponent(String(encodedQuarkFid || ''));
+    const modal = ensureQuarkCatalogPreviewModal();
+    if (!modal._previewModalInstance) modal._previewModalInstance = new bootstrap.Modal(modal);
+    modal._previewModalInstance.show();
+    document.getElementById('quarkPreviewFolderName').textContent = '正在加载…';
+    document.getElementById('quarkPreviewStatus').textContent = '正在读取商品素材…';
+    renderQuarkCatalogPreviewImages([]);
+    try {
+        const data = await requestItemPublishJson(`/quark-catalog/items/${encodeURIComponent(quarkFid)}/preview`);
+        const item = data.item || {};
+        const material = data.material || {};
+        quarkCatalogPreviewState = { quarkFid, item, material };
+        document.getElementById('quarkPreviewFolderName').textContent = item.folder_name || '夸克商品';
+        document.getElementById('quarkPreviewTitle').value = material.title || '';
+        document.getElementById('quarkPreviewDescription').value = material.description || '';
+        document.getElementById('quarkPreviewPrice').value = material.price ?? '';
+        document.getElementById('quarkPreviewOriginalPrice').value = material.original_price ?? '';
+        document.getElementById('quarkPreviewCategory').value = material.category || '';
+        document.getElementById('quarkPreviewCoverSuggestion').value = '';
+        renderQuarkCatalogPreviewImages(material.images || []);
+        document.getElementById('quarkPreviewStatus').textContent = `封面 ${Array.isArray(material.images) ? material.images.length : 0} 张；保存修改不会自动发布。`;
+    } catch (error) {
+        quarkCatalogPreviewState = null;
+        document.getElementById('quarkPreviewStatus').textContent = error.message || '读取商品素材失败';
+        showToast(error.message || '读取商品素材失败', 'danger');
+    }
+}
+
+async function regenerateQuarkCatalogCover() {
+    if (!quarkCatalogPreviewState?.quarkFid) {
+        showToast('当前没有可重新生成的商品素材', 'warning');
+        return;
+    }
+    const suggestion = document.getElementById('quarkPreviewCoverSuggestion')?.value.trim() || '';
+    const title = document.getElementById('quarkPreviewTitle')?.value.trim() || '';
+    const description = document.getElementById('quarkPreviewDescription')?.value.trim() || '';
+    if (!title || !description) {
+        showToast('请先填写商品标题和详细介绍', 'warning');
+        return;
+    }
+    const button = document.getElementById('quarkPreviewRegenerateBtn');
+    const originalHtml = button?.innerHTML || '';
+    try {
+        if (button) {
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>生成中…';
+        }
+        const status = document.getElementById('quarkPreviewStatus');
+        if (status) status.textContent = '正在按你的建议生成新封面，通常需要几十秒…';
+        const data = await requestItemPublishJson(
+            `/quark-catalog/items/${encodeURIComponent(quarkCatalogPreviewState.quarkFid)}/cover`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ suggestion, title, description })
+            }
+        );
+        quarkCatalogPreviewState.material = data.material || quarkCatalogPreviewState.material;
+        renderQuarkCatalogPreviewImages(quarkCatalogPreviewState.material.images || []);
+        if (status) status.textContent = '新封面已生成并替换首图；确认效果后可继续修改标题、介绍和价格。';
+        showToast(data.message || '新封面已生成', 'success');
+        await Promise.all([loadQuarkCatalogItems(), loadItemPublishMaterials()]);
+    } catch (error) {
+        const status = document.getElementById('quarkPreviewStatus');
+        if (status) status.textContent = error.message || '封面生成失败';
+        showToast(error.message || '封面生成失败', 'danger');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function saveQuarkCatalogPreview(loadIntoPublishForm) {
+    if (!quarkCatalogPreviewState?.quarkFid) {
+        showToast('当前没有可保存的商品素材', 'warning');
+        return;
+    }
+    const title = document.getElementById('quarkPreviewTitle')?.value.trim() || '';
+    const description = document.getElementById('quarkPreviewDescription')?.value.trim() || '';
+    if (!title || !description) {
+        showToast('商品标题和详细介绍不能为空', 'warning');
+        return;
+    }
+    const payload = {
+        title,
+        description,
+        price: parseOptionalPublishNumber(document.getElementById('quarkPreviewPrice')?.value, '现价'),
+        original_price: parseOptionalPublishNumber(document.getElementById('quarkPreviewOriginalPrice')?.value, '原价'),
+        category: document.getElementById('quarkPreviewCategory')?.value.trim() || ''
+    };
+    const saveButton = document.getElementById(loadIntoPublishForm ? 'quarkPreviewLoadBtn' : 'quarkPreviewSaveBtn');
+    const originalHtml = saveButton?.innerHTML || '';
+    try {
+        if (saveButton) {
+            saveButton.disabled = true;
+            saveButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中…';
+        }
+        const data = await requestItemPublishJson(
+            `/quark-catalog/items/${encodeURIComponent(quarkCatalogPreviewState.quarkFid)}`,
+            {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }
+        );
+        quarkCatalogPreviewState.item = data.item || quarkCatalogPreviewState.item;
+        quarkCatalogPreviewState.material = data.material || quarkCatalogPreviewState.material;
+        showToast(data.message || '商品素材已更新', 'success');
+        await Promise.all([loadQuarkCatalogItems(), loadItemPublishMaterials()]);
+        if (loadIntoPublishForm) {
+            applyItemPublishMaterialToForm(quarkCatalogPreviewState.material);
+            const quarkAccount = document.getElementById('quarkCatalogAccountId')?.value || '';
+            const publishAccount = document.getElementById('publishCookieId');
+            if (publishAccount && quarkAccount && Array.from(publishAccount.options).some(option => option.value === quarkAccount)) {
+                publishAccount.value = quarkAccount;
+            }
+            const modal = document.getElementById('quarkCatalogPreviewModal');
+            if (modal?._previewModalInstance) modal._previewModalInstance.hide();
+            window.setTimeout(() => document.getElementById('itemPublishForm')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 250);
+        }
+    } catch (error) {
+        showToast(error.message || '保存商品素材失败', 'danger');
+    } finally {
+        if (saveButton) {
+            saveButton.disabled = false;
+            saveButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function deleteQuarkCatalogMaterial(encodedQuarkFid) {
+    const quarkFid = decodeURIComponent(String(encodedQuarkFid || ''));
+    if (!quarkFid) return;
+    if (!confirm('确定删除当前生成的标题、文案和封面吗？\n\n永久分享链接会保留；再次点击“生成素材”将重新生成，并且不会被跳过。')) {
+        return;
+    }
+    try {
+        const data = await requestItemPublishJson(
+            `/quark-catalog/items/${encodeURIComponent(quarkFid)}/material`,
+            { method: 'DELETE' }
+        );
+        showToast(data.message || '生成结果已删除，可重新生成', 'success');
+        await Promise.all([loadQuarkCatalogItems(), loadItemPublishMaterials()]);
+    } catch (error) {
+        showToast(error.message || '删除生成结果失败', 'danger');
+    }
+}
+
+async function deleteQuarkCatalogItem(encodedQuarkFid, encodedFolderName, isPublished) {
+    const quarkFid = decodeURIComponent(String(encodedQuarkFid || ''));
+    const folderName = decodeURIComponent(String(encodedFolderName || ''));
+    if (!quarkFid) return;
+
+    const publishedNote = isPublished
+        ? '\n\n这只删除本地列表记录，不会删除闲鱼上已经发布的商品。'
+        : '\n\n关联的本地生成素材会一并清理，不影响夸克网盘原文件。';
+    if (!confirm(`确定删除“${folderName || quarkFid}”这一整行记录吗？${publishedNote}`)) {
+        return;
+    }
+    try {
+        const data = await requestItemPublishJson(
+            `/quark-catalog/items/${encodeURIComponent(quarkFid)}`,
+            { method: 'DELETE' }
+        );
+        showToast(data.message || '目录记录已删除', 'success');
+        await Promise.all([loadQuarkCatalogItems(), loadItemPublishMaterials()]);
+    } catch (error) {
+        showToast(error.message || '删除目录记录失败', 'danger');
+    }
+}
+
+async function loadQuarkCatalogItems() {
+    const body = document.getElementById('quarkCatalogItems');
+    if (!body) return;
+    try {
+        const data = await requestItemPublishJson('/quark-catalog/items?page=1&page_size=20');
+        const items = data.list || [];
+        if (!items.length) {
+            body.innerHTML = '<tr><td colspan="7" class="text-muted">暂无同步记录</td></tr>';
+            return;
+        }
+        const statusMap = {
+            discovered: '已发现', ready: '素材就绪', published: '已发布',
+            review_required: '待复核', failed: '失败'
+        };
+        body.innerHTML = items.map(item => {
+            const encodedFid = escapeHtml(encodeURIComponent(item.quark_fid || ''));
+            const encodedFolderName = escapeHtml(
+                encodeURIComponent(item.folder_name || item.quark_fid || '').replace(/'/g, '%27')
+            );
+            const isPublished = Boolean(item.xianyu_item_id || item.status === 'published');
+            const deleteLabel = isPublished ? '删除本地记录' : '删除整行';
+            const deleteButton = `<button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteQuarkCatalogItem('${encodedFid}', '${encodedFolderName}', ${isPublished})"><i class="bi bi-trash me-1"></i>${deleteLabel}</button>`;
+            let actions = `<div class="d-flex flex-wrap gap-2"><span class="text-muted align-self-center" title="${escapeHtml(item.error_message || '尚未生成素材')}">暂无素材</span>${deleteButton}</div>`;
+            if (item.material_id) {
+                actions = `
+                    <div class="d-flex flex-wrap gap-2">
+                      <button type="button" class="btn btn-sm btn-outline-primary" onclick="openQuarkCatalogPreview('${encodedFid}')"><i class="bi bi-eye me-1"></i>查看/编辑</button>
+                      ${deleteButton}
+                    </div>`;
+            }
+            return `
+            <tr>
+                <td>${escapeHtml(item.folder_name || '')}</td>
+                <td>${escapeHtml(item.title || '-')}</td>
+                <td>${item.metadata?.selected_price !== null && item.metadata?.selected_price !== undefined ? `¥${escapeHtml(item.metadata.selected_price)}` : '-'}</td>
+                <td>${escapeHtml(String(item.metadata?.market_research?.sample_count ?? 0))} 个</td>
+                <td title="${escapeHtml(item.error_message || '')}">${escapeHtml(statusMap[item.status] || item.status || '-')}</td>
+                <td>${escapeHtml(item.updated_at || '-')}</td>
+                <td>${actions}</td>
+            </tr>
+        `;
+        }).join('');
+    } catch (error) {
+        body.innerHTML = `<tr><td colspan="7" class="text-danger">${escapeHtml(error.message || '加载失败')}</td></tr>`;
     }
 }
 
@@ -11139,70 +12234,133 @@ function handlePublishImagesChange() {
     }
 
     const files = Array.from(input.files || []);
-    if (files.length > 0) {
-        itemPublishLoadedMaterialImages = [];
-    }
-    updateItemPublishMaterialModeBadge();
-    if (files.length > 9) {
-        showToast('单次最多上传 9 张图片', 'warning');
-        input.value = '';
-        clearItemPublishImagePreviews();
+    if (files.length === 0) {
         return;
     }
 
-    renderItemPublishImagePreviews(files);
+    const invalidFile = files.find(file => file.type && !file.type.startsWith('image/'));
+    if (invalidFile) {
+        showToast(`${invalidFile.name || '所选文件'}不是有效图片`, 'warning');
+        input.value = '';
+        return;
+    }
+
+    if (itemPublishImageItems.length + files.length > 9) {
+        showToast(`商品最多 9 张图片，当前已有 ${itemPublishImageItems.length} 张`, 'warning');
+        input.value = '';
+        return;
+    }
+
+    const createdAt = Date.now();
+    files.forEach((file, index) => {
+        itemPublishImageItems.push({
+            kind: 'file',
+            file,
+            id: `file-${createdAt}-${index}-${Math.random().toString(36).slice(2, 8)}`
+        });
+    });
+    // Clear the native picker after copying File references into our queue. This
+    // lets users select more images in several batches without replacing the
+    // images that came from a saved material.
+    input.value = '';
+    syncItemPublishStoredImages();
+    renderItemPublishImageManager();
+    updateItemPublishMaterialModeBadge();
 }
 
-function renderItemPublishImagePreviews(files) {
+function releaseItemPublishPreviewUrls() {
+    itemPublishPreviewUrls.forEach(url => URL.revokeObjectURL(url));
+    itemPublishPreviewUrls = [];
+}
+
+function syncItemPublishStoredImages() {
+    itemPublishLoadedMaterialImages = itemPublishImageItems
+        .filter(item => item?.kind === 'stored' && item.image)
+        .map(item => item.image);
+}
+
+function renderItemPublishImageManager() {
     const previewContainer = document.getElementById('publishImagePreviewList');
     const summary = document.getElementById('publishImageSummary');
-
-    clearItemPublishImagePreviews();
+    releaseItemPublishPreviewUrls();
 
     if (!previewContainer) {
         return;
     }
 
-    if (!files || files.length === 0) {
+    if (itemPublishImageItems.length === 0) {
         previewContainer.innerHTML = '<div class="item-publish-preview-empty">尚未选择图片</div>';
         if (summary) {
-            summary.textContent = '请上传 1-9 张图片，建议首图清晰展示商品主体。';
+            summary.textContent = '可分多次选择并追加，最多 9 张；第 1 张为封面，可调整顺序或删除。';
         }
         return;
     }
 
-    const totalSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
-    previewContainer.innerHTML = files.map((file, index) => {
-        const objectUrl = URL.createObjectURL(file);
-        itemPublishPreviewUrls.push(objectUrl);
+    const totalSize = itemPublishImageItems.reduce((sum, item) => (
+        sum + (item?.kind === 'file' ? (item.file?.size || 0) : Number(item.image?.size || 0))
+    ), 0);
+    previewContainer.innerHTML = itemPublishImageItems.map((item, index) => {
+        let src = '';
+        let name = `图片 ${index + 1}`;
+        let sizeText = '素材图片';
+        if (item?.kind === 'file' && item.file) {
+            src = URL.createObjectURL(item.file);
+            itemPublishPreviewUrls.push(src);
+            name = item.file.name || name;
+            sizeText = formatFileSize(item.file.size || 0);
+        } else if (item?.kind === 'stored' && item.image) {
+            src = getItemPublishImageSrc(item.image);
+            name = item.image.filename || item.image.name || name;
+            if (item.image.size) {
+                sizeText = formatFileSize(Number(item.image.size) || 0);
+            }
+        }
         return `
             <div class="item-publish-preview-card">
-                <img src="${objectUrl}" alt="预览图 ${index + 1}">
+                <span class="item-publish-preview-badge">${index === 0 ? '封面' : `详情图 ${index}`}</span>
+                <img src="${escapeHtml(src)}" alt="${escapeHtml(name)}">
                 <div class="item-publish-preview-meta">
-                    <div class="item-publish-preview-name" title="${escapeHtml(file.name || `图片 ${index + 1}`)}">${escapeHtml(file.name || `图片 ${index + 1}`)}</div>
-                    <div class="item-publish-preview-size">${formatFileSize(file.size || 0)}</div>
+                    <div class="item-publish-preview-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
+                    <div class="item-publish-preview-size">${escapeHtml(sizeText)}</div>
+                    <div class="item-publish-preview-actions">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" title="向前移动" aria-label="向前移动" onclick="moveItemPublishImage(${index}, -1)" ${index === 0 ? 'disabled' : ''}><i class="bi bi-arrow-left"></i></button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" title="向后移动" aria-label="向后移动" onclick="moveItemPublishImage(${index}, 1)" ${index === itemPublishImageItems.length - 1 ? 'disabled' : ''}><i class="bi bi-arrow-right"></i></button>
+                        <button type="button" class="btn btn-sm btn-outline-danger" title="删除图片" aria-label="删除图片" onclick="removeItemPublishImage(${index})"><i class="bi bi-trash"></i></button>
+                    </div>
                 </div>
             </div>
         `;
     }).join('');
 
     if (summary) {
-        summary.textContent = `已选择 ${files.length} 张图片，总大小 ${formatFileSize(totalSize)}。`;
+        const sizeSuffix = totalSize > 0 ? `，已知总大小 ${formatFileSize(totalSize)}` : '';
+        summary.textContent = `当前共 ${itemPublishImageItems.length} 张图片${sizeSuffix}；第 1 张将作为封面。`;
     }
 }
 
-function clearItemPublishImagePreviews() {
-    itemPublishPreviewUrls.forEach(url => URL.revokeObjectURL(url));
-    itemPublishPreviewUrls = [];
+function moveItemPublishImage(index, direction) {
+    const targetIndex = index + direction;
+    if (index < 0 || targetIndex < 0 || index >= itemPublishImageItems.length || targetIndex >= itemPublishImageItems.length) {
+        return;
+    }
+    [itemPublishImageItems[index], itemPublishImageItems[targetIndex]] = [itemPublishImageItems[targetIndex], itemPublishImageItems[index]];
+    syncItemPublishStoredImages();
+    renderItemPublishImageManager();
+}
 
-    const previewContainer = document.getElementById('publishImagePreviewList');
-    const summary = document.getElementById('publishImageSummary');
-    if (previewContainer) {
-        previewContainer.innerHTML = '<div class="item-publish-preview-empty">尚未选择图片</div>';
+function removeItemPublishImage(index) {
+    if (index < 0 || index >= itemPublishImageItems.length) {
+        return;
     }
-    if (summary) {
-        summary.textContent = '请上传 1-9 张图片，建议首图清晰展示商品主体。';
-    }
+    itemPublishImageItems.splice(index, 1);
+    syncItemPublishStoredImages();
+    renderItemPublishImageManager();
+}
+
+function clearItemPublishImagePreviews() {
+    itemPublishImageItems = [];
+    itemPublishLoadedMaterialImages = [];
+    renderItemPublishImageManager();
 }
 
 function clearItemPublishForm(clearResult = true) {
@@ -11305,7 +12463,7 @@ async function requestItemPublishJson(path, options = {}) {
     const response = await fetch(`${apiBase}${path}`, {
         ...options,
         headers: {
-            'Authorization': `Bearer ${authToken}`,
+            'Authorization': `Bearer ${getAuthToken()}`,
             ...(options.headers || {})
         }
     });
@@ -11315,6 +12473,13 @@ async function requestItemPublishJson(path, options = {}) {
         responseData = responseText ? JSON.parse(responseText) : {};
     } catch (parseError) {
         responseData = { detail: responseText || `HTTP ${response.status}` };
+    }
+    if (response.status === 401) {
+        localStorage.removeItem('auth_token');
+        authToken = '';
+        showToast('后台登录已失效，请重新登录', 'warning');
+        window.setTimeout(() => { window.location.href = '/'; }, 800);
+        throw new Error('后台登录已失效，正在返回登录页');
     }
     if (!response.ok) {
         throw new Error(responseData.detail || responseData.message || `HTTP ${response.status}`);
@@ -11345,7 +12510,10 @@ function getItemPublishFormValues() {
         deliveryChoice: document.getElementById('publishDeliveryChoice')?.value || '包邮',
         postPrice: document.getElementById('publishPostPrice')?.value.trim() || '',
         canSelfPickup: document.getElementById('publishCanSelfPickup')?.checked || false,
-        files: Array.from(document.getElementById('publishImages')?.files || [])
+        files: itemPublishImageItems
+            .filter(item => item?.kind === 'file' && item.file)
+            .map(item => item.file),
+        imageCount: itemPublishImageItems.length
     };
 }
 
@@ -11359,8 +12527,8 @@ function validateItemPublishValues(values, { requireAccount = true, requireImage
     if (!values.description) {
         throw new Error('请输入商品描述');
     }
-    if (values.files.length > 9) {
-        throw new Error('单次最多上传 9 张图片');
+    if (values.imageCount > 9) {
+        throw new Error('商品最多上传 9 张图片');
     }
     if (values.originalPrice && !values.currentPrice) {
         throw new Error('填写原价时必须同时填写现价');
@@ -11372,8 +12540,7 @@ function validateItemPublishValues(values, { requireAccount = true, requireImage
     parseOptionalPublishNumber(values.originalPrice, '原价');
     parseOptionalPublishNumber(values.postPrice, '邮费');
 
-    const imageCount = values.files.length || itemPublishLoadedMaterialImages.length;
-    if (requireImages && imageCount === 0) {
+    if (requireImages && values.imageCount === 0) {
         throw new Error('请至少上传 1 张商品图片或载入素材图片');
     }
 }
@@ -11399,6 +12566,24 @@ async function convertPublishFilesToImages(files) {
             size: file.size || 0,
             type: file.type || 'image/jpeg'
         });
+    }
+    return images;
+}
+
+async function getItemPublishCurrentImages() {
+    const images = [];
+    for (const [index, item] of itemPublishImageItems.entries()) {
+        if (item?.kind === 'stored' && item.image) {
+            images.push(item.image);
+            continue;
+        }
+        if (item?.kind === 'file' && item.file) {
+            const [image] = await convertPublishFilesToImages([item.file]);
+            if (image) {
+                image.filename = image.filename || `publish-image-${index + 1}.jpg`;
+                images.push(image);
+            }
+        }
     }
     return images;
 }
@@ -11440,43 +12625,35 @@ function updateItemPublishMaterialModeBadge() {
 }
 
 function getItemPublishImageSrc(image) {
-    const raw = String(image?.url || image?.image_url || image?.src || image?.data || image?.base64 || '').trim();
+    const raw = String(image?.url || image?.image_url || image?.src || image?.content || image?.data || image?.base64 || '').trim();
     if (!raw) {
         return '';
     }
-    if (raw.startsWith('data:') || raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('/')) {
+    // JPEG Base64 commonly starts with "/9j/".  Treating every leading slash
+    // as a local URL turns that payload into a request such as /9j/... and
+    // produces a broken image.  Only known browser-safe URL schemes and the
+    // app's static-file prefix should bypass Base64 wrapping.
+    if (
+        raw.startsWith('data:') ||
+        raw.startsWith('blob:') ||
+        raw.startsWith('http://') ||
+        raw.startsWith('https://') ||
+        raw.startsWith('/static/')
+    ) {
         return raw;
     }
     return `data:image/jpeg;base64,${raw}`;
 }
 
 function renderItemPublishStoredImagePreviews(images) {
-    const previewContainer = document.getElementById('publishImagePreviewList');
-    const summary = document.getElementById('publishImageSummary');
-    clearItemPublishImagePreviews();
-    if (!previewContainer) {
-        return;
-    }
     const safeImages = Array.isArray(images) ? images : [];
-    if (safeImages.length === 0) {
-        return;
-    }
-    previewContainer.innerHTML = safeImages.map((image, index) => {
-        const src = getItemPublishImageSrc(image);
-        const name = image?.filename || image?.name || `素材图片 ${index + 1}`;
-        return `
-            <div class="item-publish-preview-card">
-                <img src="${escapeHtml(src)}" alt="${escapeHtml(name)}">
-                <div class="item-publish-preview-meta">
-                    <div class="item-publish-preview-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
-                    <div class="item-publish-preview-size">素材图片</div>
-                </div>
-            </div>
-        `;
-    }).join('');
-    if (summary) {
-        summary.textContent = `已载入素材图片 ${safeImages.length} 张；如重新选择文件，将替换素材图片。`;
-    }
+    itemPublishImageItems = safeImages.slice(0, 9).map((image, index) => ({
+        kind: 'stored',
+        image,
+        id: `stored-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`
+    }));
+    syncItemPublishStoredImages();
+    renderItemPublishImageManager();
 }
 
 function startNewItemPublishMaterial() {
@@ -11500,9 +12677,7 @@ async function saveItemPublishMaterial() {
     try {
         const values = getItemPublishFormValues();
         validateItemPublishValues(values, { requireAccount: false, requireImages: true });
-        const images = values.files.length > 0
-            ? await convertPublishFilesToImages(values.files)
-            : [...itemPublishLoadedMaterialImages];
+        const images = await getItemPublishCurrentImages();
         if (images.length === 0) {
             throw new Error('请至少上传 1 张商品图片或载入素材图片');
         }
@@ -11594,13 +12769,7 @@ function renderItemPublishMaterials() {
     }).join('');
 }
 
-function loadItemPublishMaterialToForm(materialId) {
-    const material = itemPublishMaterials.find(item => Number(item.id) === Number(materialId));
-    if (!material) {
-        showToast('未找到商品素材，请刷新后重试', 'warning');
-        return;
-    }
-
+function applyItemPublishMaterialToForm(material) {
     document.getElementById('publishTitle').value = material.title || '';
     document.getElementById('publishCategory').value = material.category || '';
     document.getElementById('publishDescription').value = material.description || '';
@@ -11621,6 +12790,15 @@ function loadItemPublishMaterialToForm(materialId) {
     updateItemPublishMaterialModeBadge();
     renderItemPublishMaterials();
     showToast('已载入商品素材，可直接发布或继续编辑', 'info');
+}
+
+function loadItemPublishMaterialToForm(materialId) {
+    const material = itemPublishMaterials.find(item => Number(item.id) === Number(materialId));
+    if (!material) {
+        showToast('未找到商品素材，请刷新后重试', 'warning');
+        return;
+    }
+    applyItemPublishMaterialToForm(material);
 }
 
 async function deleteItemPublishMaterial(materialId) {
@@ -11699,7 +12877,7 @@ function renderItemPublishLogs() {
 
 async function submitItemPublishForm() {
     if (itemPublishSubmitting) {
-        return;
+        return false;
     }
 
     const values = getItemPublishFormValues();
@@ -11709,7 +12887,7 @@ async function submitItemPublishForm() {
         validateItemPublishValues(values, { requireAccount: true, requireImages: true });
     } catch (error) {
         showToast(error.message || '请完善发布信息', 'warning');
-        return;
+        return false;
     }
 
     itemPublishSubmitting = true;
@@ -11719,55 +12897,27 @@ async function submitItemPublishForm() {
     }
 
     try {
-        let responseData;
-        if (values.files.length > 0) {
-            const formData = new FormData();
-            formData.append('cookie_id', values.accountId);
-            formData.append('title', values.title);
-            formData.append('category', values.category);
-            formData.append('description', values.description);
-            formData.append('current_price', values.currentPrice);
-            formData.append('original_price', values.originalPrice);
-            formData.append('delivery_choice', values.deliveryChoice);
-            formData.append('post_price', values.postPrice);
-            formData.append('can_self_pickup', values.canSelfPickup ? 'true' : 'false');
-            values.files.forEach(file => formData.append('images', file));
-
-            const response = await fetch(`${apiBase}/item-publish`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${authToken}`
-                },
-                body: formData
-            });
-
-            const responseText = await response.text();
-            try {
-                responseData = responseText ? JSON.parse(responseText) : {};
-            } catch (parseError) {
-                responseData = { detail: responseText || `HTTP ${response.status}` };
-            }
-
-            if (!response.ok) {
-                throw new Error(responseData.detail || responseData.message || `HTTP ${response.status}`);
-            }
-        } else {
-            const payload = buildItemPublishJsonPayload(values, itemPublishLoadedMaterialImages);
-            responseData = await requestItemPublishJson('/product-publish', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-        }
+        // Use one JSON route for both stored material images and newly selected
+        // files. It preserves the user's mixed image order and prevents a local
+        // file selection from silently dropping the material cover.
+        const images = await getItemPublishCurrentImages();
+        const payload = buildItemPublishJsonPayload(values, images);
+        const responseData = await requestItemPublishJson('/product-publish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
 
         renderItemPublishResult(responseData, true);
         showToast(responseData.message || '商品发布成功', 'success');
         await loadItemPublishLogs();
+        return true;
     } catch (error) {
         console.error('发布商品失败:', error);
         const errorMessage = error.message || '发布商品失败';
         renderItemPublishResult({ message: errorMessage, detail: errorMessage }, false);
         showToast(errorMessage, 'danger');
+        return false;
     } finally {
         itemPublishSubmitting = false;
         if (submitButton) {
@@ -16707,6 +17857,7 @@ function createOrderRow(order) {
 
     // 判断是否可以手动发货（允许多次发货，除了交易关闭的订单）
     const canDeliver = !['cancelled', 'refunding'].includes(normalizedStatus);
+    const canResend = normalizedStatus === 'shipped';
 
     let specHtml = '-';
     if (order.spec_name && order.spec_value) {
@@ -16766,6 +17917,10 @@ function createOrderRow(order) {
                     <button class="btn btn-outline-success btn-sm order-action-btn" data-order-action="deliver" data-order-id="${orderId}" title="手动发货" ${canDeliver ? '' : 'disabled'}>
                         <i class="bi bi-truck"></i>
                     </button>
+                    ${canResend ? `
+                    <button class="btn btn-outline-warning btn-sm order-action-btn" data-order-action="resend" data-order-id="${orderId}" title="补发卡券（重新发送聊天内容）">
+                        <i class="bi bi-send"></i>
+                    </button>` : ''}
                     <button class="btn btn-outline-info btn-sm order-action-btn" data-order-action="refresh" data-order-id="${orderId}" title="刷新状态">
                         <i class="bi bi-arrow-repeat"></i>
                     </button>
@@ -17796,16 +18951,19 @@ async function batchDeleteOrders() {
 }
 
 // 手动发货订单
-async function manualDeliverOrder(orderId) {
+async function manualDeliverOrder(orderId, resend = false) {
     try {
-        const confirmed = confirm(`确定要手动发货此订单吗？\n\n订单ID: ${orderId}\n\n系统将根据发货规则自动匹配发货内容并发送给买家。`);
+        const confirmed = confirm(resend
+            ? `确定要补发卡券吗？\n\n订单ID: ${orderId}\n\n订单已标记为已发货，系统会重新匹配发货内容并发送到买家会话。`
+            : `确定要手动发货此订单吗？\n\n订单ID: ${orderId}\n\n系统将根据发货规则自动匹配发货内容并发送给买家。`);
         if (!confirmed) {
             return;
         }
 
         showToast('正在执行发货...', 'info');
 
-        const response = await fetch(`${apiBase}/api/orders/${orderId}/deliver`, {
+        const deliverUrl = `${apiBase}/api/orders/${orderId}/deliver${resend ? '?resend=true' : ''}`;
+        const response = await fetch(deliverUrl, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${authToken}`,
@@ -18011,6 +19169,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
             if (action === 'deliver') {
                 manualDeliverOrder(orderId);
+            } else if (action === 'resend') {
+                manualDeliverOrder(orderId, true);
             } else if (action === 'confirm-retry') {
                 retryOrderPlatformConfirm(orderId);
             } else if (action === 'refresh') {

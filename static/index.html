@@ -89,6 +89,12 @@
           <span>商品发布</span>
         </a>
       </div>
+      <div class="nav-item" data-menu-id="content-products">
+        <a href="javascript:void(0)" class="nav-link" onclick="showSection('content-products')">
+          <i class="bi bi-link-45deg"></i>
+          <span>链接商品化</span>
+        </a>
+      </div>
       <div class="nav-item" data-menu-id="items">
         <a href="javascript:void(0)" class="nav-link" onclick="showSection('items')">
           <i class="bi bi-box-seam"></i>
@@ -823,6 +829,244 @@
       </div>
 
       <div class="content-body">
+        <div class="card mb-4 border-success-subtle" id="aiProductCreatorCard">
+          <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div>
+              <h5 class="mb-1"><i class="bi bi-magic me-2"></i>AI 商品创作</h5>
+              <div class="text-muted small">输入文字需求，可选参考图，自动生成可编辑标题、详情、建议价和商品封面</div>
+            </div>
+            <span class="badge text-bg-success">文字 / 文字+图片</span>
+          </div>
+          <div class="card-body">
+            <div class="alert alert-light border py-2 small">
+              文案与参考图会发送到你在下方配置的 AI 服务商。点击“生成商品素材”只会进入预览；“生成并一键上架”会在生成完成后立即发布。
+            </div>
+            <div class="row g-3">
+              <div class="col-12">
+                <label class="form-label" for="aiProductBrief">这次想上架什么商品</label>
+                <textarea class="form-control" id="aiProductBrief" rows="4" maxlength="5000" placeholder="例如：上架一台自用九成新的白色机械键盘，87 键茶轴，使用半年，功能正常，带原装数据线；希望突出手感和桌搭效果。"></textarea>
+                <div class="form-text">请写清商品是什么、成色/规格、核心卖点、包含物品和交付方式；AI 不会补写你没有提供的事实。</div>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label" for="aiProductReferenceImages">参考图 <span class="text-muted small">（可选，最多 4 张）</span></label>
+                <input type="file" class="form-control" id="aiProductReferenceImages" accept="image/*" multiple onchange="handleAIProductReferenceImagesChange()">
+                <div class="form-text">支持商品实拍、风格参考或现有素材；生成封面后，这些图片也会保留为商品附图。</div>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label" for="aiProductCreatorAccountId">闲鱼账号</label>
+                <select class="form-select" id="aiProductCreatorAccountId" onchange="syncAIProductCreatorAccount()">
+                  <option value="">请选择账号</option>
+                </select>
+                <div class="form-text">用于同款调研和一键上架；仅生成素材时可不选。</div>
+              </div>
+              <div class="col-12">
+                <div id="aiProductReferencePreviewList" class="item-publish-preview-list">
+                  <div class="item-publish-preview-empty">尚未选择参考图</div>
+                </div>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="aiProductCategoryHint">类目提示 <span class="text-muted small">（可选）</span></label>
+                <input class="form-control" id="aiProductCategoryHint" maxlength="80" placeholder="例如：数码键盘、图书资料">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="aiProductMarketQuery">同款搜索词 <span class="text-muted small">（可选）</span></label>
+                <input class="form-control" id="aiProductMarketQuery" maxlength="40" placeholder="例如：87键 茶轴 机械键盘">
+              </div>
+              <div class="col-md-2">
+                <label class="form-label" for="aiProductPriceHint">期望售价</label>
+                <input type="number" class="form-control" id="aiProductPriceHint" min="0" step="0.01" placeholder="AI 建议">
+              </div>
+              <div class="col-md-2">
+                <label class="form-label" for="aiProductOriginalPriceHint">原价</label>
+                <input type="number" class="form-control" id="aiProductOriginalPriceHint" min="0" step="0.01" placeholder="可选">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="aiProductDeliveryChoice">运费方式</label>
+                <select class="form-select" id="aiProductDeliveryChoice">
+                  <option value="包邮">包邮</option>
+                  <option value="按距离计费">按距离计费</option>
+                  <option value="无需邮寄">无需邮寄</option>
+                </select>
+              </div>
+              <div class="col-md-8 d-flex align-items-end">
+                <div class="form-check form-switch mb-2">
+                  <input class="form-check-input" type="checkbox" id="aiProductMarketResearch" checked>
+                  <label class="form-check-label" for="aiProductMarketResearch">生成前参考闲鱼同款标题、公开热度与市场价</label>
+                  <div class="form-text">调研失败会自动降级继续生成，不会把“想要人数”当作真实销量。</div>
+                </div>
+              </div>
+            </div>
+            <div class="d-flex flex-wrap gap-2 mt-4">
+              <button class="btn btn-success" type="button" id="aiProductGenerateBtn" onclick="generateAIProductDraft(false)">
+                <i class="bi bi-stars me-1"></i>生成商品素材
+              </button>
+              <button class="btn btn-danger" type="button" id="aiProductGeneratePublishBtn" onclick="generateAIProductDraft(true)">
+                <i class="bi bi-cloud-upload me-1"></i>生成并一键上架
+              </button>
+              <button class="btn btn-outline-secondary" type="button" onclick="clearAIProductCreator()">
+                <i class="bi bi-arrow-counterclockwise me-1"></i>清空
+              </button>
+            </div>
+            <div class="alert alert-light border mt-3 mb-0 small" id="aiProductCreatorStatus">等待输入商品需求</div>
+          </div>
+        </div>
+
+        <div class="card mb-4 border-primary-subtle">
+          <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div>
+              <h5 class="mb-1"><i class="bi bi-stars me-2"></i>夸克网盘 AI 自动上架</h5>
+              <div class="text-muted small">同步文件夹 → 生成标题/介绍/封面 → 创建分享与发货规则 → 可选自动发布</div>
+            </div>
+            <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#quarkCatalogPanel">
+              配置与运行
+            </button>
+          </div>
+          <div class="collapse" id="quarkCatalogPanel">
+            <div class="card-body">
+              <div class="alert alert-warning py-2 small">
+                仅同步并销售你有权分发的内容。建议先关闭“自动发布”运行一轮，在素材库检查生成结果。
+              </div>
+              <div class="row g-3">
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkCatalogAccountId">闲鱼发布账号</label>
+                  <select class="form-select" id="quarkCatalogAccountId"><option value="">请选择账号</option></select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkCatalogRootFid">商品来源目录</label>
+                  <div class="input-group">
+                    <input class="form-control" id="quarkCatalogRootFid" value="0" placeholder="0 表示网盘根目录" oninput="handleQuarkRootFidInput()">
+                    <button class="btn btn-outline-primary" type="button" onclick="openQuarkFolderPicker()">
+                      <i class="bi bi-folder2-open me-1"></i>浏览
+                    </button>
+                  </div>
+                  <input type="hidden" id="quarkCatalogRootName" value="根目录">
+                  <div class="form-text" id="quarkCatalogRootLabel">当前选择：根目录</div>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkCatalogScope">目录处理方式</label>
+                  <select class="form-select" id="quarkCatalogScope">
+                    <option value="child_folders">每个直接子文件夹作为一个商品</option>
+                    <option value="selected_folder">所选目录及其文件作为一个商品</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkCatalogMaxItems">每轮最多处理</label>
+                  <input type="number" class="form-control" id="quarkCatalogMaxItems" min="1" max="30" value="5">
+                  <div class="form-text">“所选目录作为一个商品”时固定只处理 1 个。</div>
+                </div>
+                <div class="col-12">
+                  <label class="form-label" for="quarkCatalogCookie">夸克网页登录 Cookie</label>
+                  <textarea class="form-control" id="quarkCatalogCookie" rows="2" placeholder="留空表示保留已保存的 Cookie"></textarea>
+                  <div class="form-text" id="quarkCatalogCookieState">尚未配置</div>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkTextBaseUrl">文案 API 地址</label>
+                  <input class="form-control" id="quarkTextBaseUrl" value="https://api.openai.com/v1">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkTextModel">文案模型</label>
+                  <input class="form-control" id="quarkTextModel" value="gpt-5-mini">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkTextApiKey">文案 API Key</label>
+                  <div class="input-group">
+                    <input type="password" class="form-control" id="quarkTextApiKey" name="quark_text_api_key_new" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" readonly placeholder="已保存的 Key 不会显示">
+                    <button class="btn btn-outline-primary" id="quarkTextApiKeyEditButton" type="button" onclick="enableQuarkCatalogSecretEdit('text_api_key')">修改</button>
+                  </div>
+                  <div class="form-text" id="quarkTextApiKeyState">尚未配置</div>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkImageBaseUrl">生图 API 地址</label>
+                  <input class="form-control" id="quarkImageBaseUrl" value="https://api.openai.com/v1">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkImageModel">生图模型</label>
+                  <input class="form-control" id="quarkImageModel" value="gpt-image-1">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkImageApiKey">生图 API Key</label>
+                  <div class="input-group">
+                    <input type="password" class="form-control" id="quarkImageApiKey" name="quark_image_api_key_new" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" readonly placeholder="已保存的 Key 不会显示">
+                    <button class="btn btn-outline-primary" id="quarkImageApiKeyEditButton" type="button" onclick="enableQuarkCatalogSecretEdit('image_api_key')">修改</button>
+                  </div>
+                  <div class="form-text" id="quarkImageApiKeyState">尚未配置；首次可复用文案 Key</div>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label" for="quarkCatalogPrice">默认售价</label>
+                  <input type="number" class="form-control" id="quarkCatalogPrice" min="0" step="0.01">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label" for="quarkCatalogOriginalPrice">默认原价</label>
+                  <input type="number" class="form-control" id="quarkCatalogOriginalPrice" min="0" step="0.01">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label" for="quarkCatalogCategory">类目提示</label>
+                  <input class="form-control" id="quarkCatalogCategory" placeholder="例如：学习资料">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label" for="quarkCatalogRunHour">每日运行小时</label>
+                  <input type="number" class="form-control" id="quarkCatalogRunHour" min="0" max="23" value="8">
+                </div>
+                <div class="col-12">
+                  <label class="form-label" for="quarkCatalogCopyBackground">真实文案背景（可选）</label>
+                  <textarea class="form-control" id="quarkCatalogCopyBackground" rows="2" maxlength="500" placeholder="例如：这套资料是我之前花 999 元购买并自行整理的，现在用不上了，低价分享给真正需要的人。"></textarea>
+                  <div class="form-text">只填写真实、可核实的信息。AI 会把购入经历、整理原因等写成自然开场；留空时不会虚构购入金额。</div>
+                </div>
+                <div class="col-md-4">
+                  <div class="form-check form-switch mt-4">
+                    <input class="form-check-input" type="checkbox" id="quarkMarketResearchEnabled" checked>
+                    <label class="form-check-label" for="quarkMarketResearchEnabled">先搜索闲鱼同款并智能定价</label>
+                  </div>
+                  <div class="form-text">按公开“想要人数”排序作为热度参考，不代表真实销量。</div>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkMarketSampleSize">同款样本数</label>
+                  <input type="number" class="form-control" id="quarkMarketSampleSize" min="3" max="30" value="12">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkPricingStrategy">定价策略</label>
+                  <select class="form-select" id="quarkPricingStrategy">
+                    <option value="competitive">竞争价（中位价约 95%）</option>
+                    <option value="median">市场中位价</option>
+                    <option value="premium">精品价（中位价约 108%）</option>
+                    <option value="traffic">拉新引流固定价</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label" for="quarkTrafficPrice">拉新固定价</label>
+                  <input type="number" class="form-control" id="quarkTrafficPrice" min="0.01" step="0.01" value="0.10">
+                  <div class="form-text">选择“拉新引流固定价”时生效；必须是买家真实成交价，引流模式不设置划线原价。</div>
+                </div>
+                <div class="col-md-4">
+                  <div class="form-check form-switch mt-4">
+                    <input class="form-check-input" type="checkbox" id="quarkCatalogAutoPublish">
+                    <label class="form-check-label" for="quarkCatalogAutoPublish">生成后自动发布</label>
+                  </div>
+                </div>
+                <div class="col-md-4">
+                  <div class="form-check form-switch mt-4">
+                    <input class="form-check-input" type="checkbox" id="quarkCatalogScheduleEnabled">
+                    <label class="form-check-label" for="quarkCatalogScheduleEnabled">每天定时同步</label>
+                  </div>
+                </div>
+              </div>
+              <div class="d-flex flex-wrap gap-2 mt-4">
+                <button class="btn btn-primary" type="button" onclick="saveQuarkCatalogSettings()"><i class="bi bi-save me-1"></i>保存配置</button>
+                <button class="btn btn-outline-primary" type="button" onclick="testQuarkCatalogConnection()"><i class="bi bi-plug me-1"></i>测试夸克连接</button>
+                <button class="btn btn-outline-success" type="button" onclick="startQuarkCatalogSync(false)"><i class="bi bi-magic me-1"></i>生成素材</button>
+                <button class="btn btn-outline-warning" type="button" onclick="startQuarkCatalogSync(false, true)"><i class="bi bi-arrow-repeat me-1"></i>重新生成已有素材</button>
+                <button class="btn btn-danger" type="button" onclick="startQuarkCatalogSync(true)"><i class="bi bi-cloud-upload me-1"></i>生成并发布</button>
+              </div>
+              <div class="alert alert-light border mt-3 mb-0 small" id="quarkCatalogStatus">尚未运行</div>
+              <div class="table-responsive mt-3">
+                <table class="table table-sm align-middle mb-0">
+                  <thead><tr><th>夸克文件夹</th><th>生成标题</th><th>定价</th><th>市场样本</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+                  <tbody id="quarkCatalogItems"><tr><td colspan="7" class="text-muted">暂无同步记录</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
         <div class="row g-4 item-publish-layout">
           <div class="col-xl-8">
             <div class="card item-publish-form-card">
@@ -911,9 +1155,8 @@
                         accept="image/*"
                         multiple
                         onchange="handlePublishImagesChange()"
-                        required
                       >
-                      <div class="form-text" id="publishImageSummary">请上传 1-9 张图片，建议首图清晰展示商品主体。</div>
+                      <div class="form-text" id="publishImageSummary">可分多次选择并追加，最多 9 张；第 1 张为封面，可调整顺序或删除。</div>
                     </div>
 
                     <div class="col-12">
@@ -1012,6 +1255,98 @@
               </div>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 链接商品化 -->
+    <div id="content-products-section" class="content-section">
+      <div class="content-header">
+        <h2 class="mb-0"><i class="bi bi-link-45deg me-2"></i>链接商品化</h2>
+        <p class="text-muted mb-0">把公开文章或粘贴的长文整理成可售卖文档 / Skill 包，并载入可编辑发布表单</p>
+      </div>
+      <div class="content-body">
+        <div class="card border-primary-subtle mb-4">
+          <div class="card-header">
+            <h5 class="mb-1"><i class="bi bi-magic me-2"></i>从链接生成内容商品</h5>
+            <div class="text-muted small">动态渲染的 X 页面可以同时粘贴正文；系统会保存来源链接、整理稿和原文快照，生成后可编辑再发布。</div>
+          </div>
+          <div class="card-body">
+            <div class="row g-3">
+              <div class="col-md-8">
+                <label class="form-label" for="contentProductSourceUrl">文章链接</label>
+                <input class="form-control" id="contentProductSourceUrl" type="url" placeholder="https://x.com/... 或其他公开文章链接">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="contentProductOutputMode">交付形式</label>
+                <select class="form-select" id="contentProductOutputMode">
+                  <option value="bundle" selected>文档 + Skill 组合包</option>
+                  <option value="document">仅 Markdown 文档</option>
+                  <option value="skill">仅 Skill 包</option>
+                </select>
+              </div>
+              <div class="col-12">
+                <label class="form-label" for="contentProductSourceText">正文补充（推荐）</label>
+                <textarea class="form-control" id="contentProductSourceText" rows="8" maxlength="50000" placeholder="把 X 长文正文粘贴到这里；如果链接页面可以直接读取，也可以留空"></textarea>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="contentProductRightsStatus">来源状态</label>
+                <select class="form-select" id="contentProductRightsStatus">
+                  <option value="reference_only" selected>仅作参考，生成后人工确认</option>
+                  <option value="self_owned">我自己创作</option>
+                  <option value="licensed">已取得分发许可</option>
+                  <option value="public_domain">公开领域 / 允许再分发</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="contentProductCategory">类目提示</label>
+                <input class="form-control" id="contentProductCategory" maxlength="80" placeholder="例如：学习资料、AI 工具、职场教程">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="contentProductAccount">闲鱼账号（可选）</label>
+                <select class="form-select" id="contentProductAccount"><option value="">仅生成，不发布</option></select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label" for="contentProductPrice">期望售价</label>
+                <input class="form-control" id="contentProductPrice" type="number" min="0" step="0.01" placeholder="参考同款或手动填写">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label" for="contentProductOriginalPrice">原价（可选）</label>
+                <input class="form-control" id="contentProductOriginalPrice" type="number" min="0" step="0.01">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label" for="contentProductDelivery">交付方式</label>
+                <select class="form-select" id="contentProductDelivery">
+                  <option value="无需邮寄" selected>无需邮寄</option>
+                  <option value="包邮">包邮</option>
+                </select>
+              </div>
+              <div class="col-md-3 d-flex align-items-end">
+                <div class="form-check form-switch mb-2">
+                  <input class="form-check-input" type="checkbox" id="contentProductMarketResearch" checked>
+                  <label class="form-check-label" for="contentProductMarketResearch">参考同款价格</label>
+                </div>
+              </div>
+              <div class="col-12">
+                <label class="form-label" for="contentProductDeliveryText">自动发货文字 / 永久分享链接（可选）</label>
+                <textarea class="form-control" id="contentProductDeliveryText" rows="3" maxlength="12000" placeholder="填写买家付款后要收到的文字、夸克永久分享链接、飞书文档链接等；填写后会自动创建卡券和按标题匹配的发货规则"></textarea>
+                <div class="form-text">留空时只生成内容包和商品素材，不会创建自动发货规则。请使用长期有效、买家可访问的链接。</div>
+              </div>
+            </div>
+            <div class="d-flex flex-wrap gap-2 mt-4">
+              <button class="btn btn-primary" type="button" id="contentProductGenerateBtn" onclick="generateContentProduct(false)"><i class="bi bi-stars me-1"></i>生成内容包</button>
+              <button class="btn btn-danger" type="button" id="contentProductGeneratePublishBtn" onclick="generateContentProduct(true)"><i class="bi bi-cloud-upload me-1"></i>生成并上架</button>
+              <button class="btn btn-outline-secondary" type="button" onclick="clearContentProductForm()"><i class="bi bi-arrow-counterclockwise me-1"></i>清空</button>
+            </div>
+            <div class="alert alert-light border mt-3 mb-0 small" id="contentProductStatus">等待输入链接或正文</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">已生成内容商品</h5>
+            <button class="btn btn-sm btn-outline-primary" type="button" onclick="loadContentProducts()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+          </div>
+          <div class="card-body"><div id="contentProductList" class="table-responsive"><div class="text-muted small">暂无生成记录</div></div></div>
         </div>
       </div>
     </div>
@@ -5093,7 +5428,7 @@
 
   <!-- JS依赖 -->
   <script src="/static/lib/bootstrap/bootstrap.bundle.min.js"></script>
-  <script src="/static/js/app.js?v=1.2.9"></script>
+    <script src="/static/js/app.js?v=1.2.19"></script>
 
   <!-- 默认回复管理模态框 -->
   <div class="modal fade" id="defaultReplyModal" tabindex="-1" aria-labelledby="defaultReplyModalLabel" aria-hidden="true">

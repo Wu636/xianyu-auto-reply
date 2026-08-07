@@ -17,7 +17,7 @@ class ImageUploader:
     
     def __init__(self, cookies_str: str):
         self.cookies_str = cookies_str
-        self.upload_url = "https://stream-upload.goofish.com/api/upload.api?floderId=0&appkey=xy_chat&_input_charset=utf-8"
+        self.upload_url = "https://stream-upload.goofish.com/api/upload.api?floderId=0&appkey=fleamarket&_input_charset=utf-8"
         self.session = None
         self.last_error_type = None
         self.last_error_message = None

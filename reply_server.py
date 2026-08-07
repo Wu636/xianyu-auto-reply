@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, Response, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Tuple, Optional, Dict, Any, Callable, Awaitable
@@ -15,6 +15,7 @@ import os
 import re
 import uuid
 import base64
+import shutil
 from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
@@ -35,6 +36,29 @@ from utils.qr_login import qr_login_manager
 from utils.qr_login_lite import qrcode_login_lite
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
+from utils.quark_catalog_pipeline import (
+    CatalogAIClient,
+    CatalogAIError,
+    QUARK_SHARE_PERMANENT_EXPIRED_TYPE,
+    QuarkDriveClient,
+    QuarkDriveError,
+    QuarkEntry,
+    build_delivery_text,
+    build_folder_fingerprint,
+    build_market_search_query,
+    choose_listing_price,
+    normalize_cover_image,
+    parse_market_price,
+    summarize_market_items,
+)
+from utils.content_productizer import (
+    ContentProductError,
+    ContentSource,
+    fetch_content_source,
+    merge_source,
+    validate_source_url,
+    write_product_package,
+)
 from utils.time_utils import (
     LOCAL_TIMEZONE,
     get_local_now,
@@ -10196,6 +10220,100 @@ class ProductSinglePublishRequest(BaseModel):
     condition: Optional[str] = "全新"
 
 
+class QuarkCatalogSettingsRequest(BaseModel):
+    account_id: Optional[str] = None
+    quark_cookie: Optional[str] = None
+    root_fid: Optional[str] = "0"
+    root_folder_name: Optional[str] = "根目录"
+    catalog_scope: Optional[str] = "child_folders"
+    text_base_url: Optional[str] = "https://api.openai.com/v1"
+    text_api_key: Optional[str] = None
+    text_model: Optional[str] = "gpt-5-mini"
+    image_base_url: Optional[str] = "https://api.openai.com/v1"
+    image_api_key: Optional[str] = None
+    image_model: Optional[str] = "gpt-image-1"
+    image_size: Optional[str] = "1024x1024"
+    default_price: Optional[float] = None
+    default_original_price: Optional[float] = None
+    category_hint: Optional[str] = None
+    copy_background: Optional[str] = None
+    title_max_chars: Optional[int] = 30
+    max_items_per_run: Optional[int] = 5
+    market_research_enabled: Optional[bool] = True
+    market_sample_size: Optional[int] = 12
+    pricing_strategy: Optional[str] = "competitive"
+    traffic_price: Optional[float] = 0.1
+    auto_publish: Optional[bool] = False
+    schedule_enabled: Optional[bool] = False
+    run_hour: Optional[int] = 8
+    random_delay_max: Optional[int] = 10
+
+
+class QuarkCatalogSyncRequest(BaseModel):
+    publish: Optional[bool] = None
+    force: bool = False
+    max_items: Optional[int] = None
+
+
+class QuarkFolderListRequest(BaseModel):
+    parent_fid: Optional[str] = "0"
+    quark_cookie: Optional[str] = None
+
+
+class QuarkCatalogItemUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    original_price: Optional[float] = None
+    category: Optional[str] = None
+
+
+class QuarkCatalogCoverRegenerateRequest(BaseModel):
+    suggestion: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+
+class AIProductCreatorRequest(BaseModel):
+    description: str
+    reference_images: List[Any] = []
+    account_id: Optional[str] = None
+    category_hint: Optional[str] = None
+    market_query: Optional[str] = None
+    market_research: Optional[bool] = None
+    price_hint: Optional[float] = None
+    original_price_hint: Optional[float] = None
+    delivery_method: Optional[str] = "包邮"
+
+
+class ContentProductGenerateRequest(BaseModel):
+    """Create a sellable document/Skill package from a source link or pasted text."""
+    source_url: Optional[str] = None
+    source_text: Optional[str] = None
+    output_mode: str = "bundle"  # document / skill / bundle
+    rights_status: str = "reference_only"  # self_owned / licensed / public_domain / reference_only
+    category_hint: Optional[str] = None
+    market_query: Optional[str] = None
+    market_research: Optional[bool] = None
+    price_hint: Optional[float] = None
+    original_price_hint: Optional[float] = None
+    delivery_method: str = "无需邮寄"
+    account_id: Optional[str] = None
+    publish_after_review: bool = False
+    delivery_text: Optional[str] = None
+
+
+class ContentProductUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    price: Optional[float] = None
+    original_price: Optional[float] = None
+    rights_status: Optional[str] = None
+    output_mode: Optional[str] = None
+    delivery_text: Optional[str] = None
+
+
 def _parse_optional_non_negative_float(value: Any, field_label: str) -> Optional[float]:
     if value is None:
         return None
@@ -10257,7 +10375,7 @@ async def _sync_items_after_publish(
     try:
         page_sync_result = await xianyu_instance.get_item_list_info(
             page_number=1,
-            page_size=100,
+            page_size=20,
             sync_item_details=True,
         )
 
@@ -10266,7 +10384,7 @@ async def _sync_items_after_publish(
 
         if published_item_id and not item_synced:
             fallback_result = await xianyu_instance.get_all_items(
-                page_size=100,
+                page_size=20,
                 max_pages=3,
                 sync_item_details=True,
             )
@@ -10498,6 +10616,12 @@ async def _publish_product_to_account(
         db_manager.update_publish_log(created_log_id, status='publishing')
 
     try:
+        _sync_content_product_before_publish(
+            user_id=current_user['user_id'], material_id=material_id, title=cleaned_title,
+            description=cleaned_description, price=current_price_value,
+            original_price=original_price_value,
+            category=category_hint,
+        )
         logger.info(
             f"{user_prefix} 开始发布商品: cookie_id={cleaned_account_id}, "
             f"title={cleaned_title}, images={len(image_payloads)}, delivery_choice={delivery_choice}"
@@ -10560,6 +10684,25 @@ async def _publish_product_to_account(
 
         sync_status, sync_message, sync_total_count, sync_saved_count = _summarize_publish_sync(sync_result)
         item_url = _build_published_item_url(published_item_id)
+
+        # 即使发布后的商品列表同步被平台限流，也要立即把本次发布的
+        # 标题/描述写入本地 item_info。自动发货依赖它们匹配对应卡券，
+        # 不能因为同步失败而退化成“待获取商品信息”。
+        if published_item_id:
+            try:
+                db_manager.save_item_basic_info(
+                    cleaned_account_id,
+                    str(published_item_id),
+                    item_title=cleaned_title,
+                    item_description=cleaned_description,
+                    item_price=(f"¥{current_price_value:.2f}" if current_price_value is not None else None),
+                    item_detail=cleaned_description,
+                )
+            except Exception as item_cache_exc:
+                logger.warning(
+                    f"{user_prefix} 商品已发布，但写入本地商品缓存失败: "
+                    f"item_id={published_item_id}, error={mask_sensitive_text(item_cache_exc)}"
+                )
 
         if created_log_id:
             db_manager.update_publish_log(
@@ -10653,6 +10796,1580 @@ async def _run_product_batch_publish(batch_id: str, jobs: List[Dict[str, Any]], 
                 f"account_id={account_id}, material_id={material.get('id')}, error={mask_sensitive_text(exc)}"
             )
     logger.info(f"{get_user_log_prefix(current_user)} 商品批量发布任务结束: batch_id={batch_id}")
+
+
+# ==================== 夸克目录自动上架 ====================
+
+QUARK_CATALOG_JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def _quark_catalog_defaults() -> Dict[str, Any]:
+    return {
+        'account_id': '',
+        'root_fid': '0',
+        'root_folder_name': '根目录',
+        'catalog_scope': 'child_folders',
+        'text_base_url': 'https://api.openai.com/v1',
+        'text_model': 'gpt-5-mini',
+        'image_base_url': 'https://api.openai.com/v1',
+        'image_model': 'gpt-image-1',
+        'image_size': '1024x1024',
+        'default_price': None,
+        'default_original_price': None,
+        'category_hint': '',
+        'copy_background': '',
+        'title_max_chars': 30,
+        'max_items_per_run': 5,
+        'market_research_enabled': True,
+        'market_sample_size': 12,
+        'pricing_strategy': 'competitive',
+        'traffic_price': 0.1,
+        'auto_publish': False,
+        'schedule_enabled': False,
+        'run_hour': 8,
+        'random_delay_max': 10,
+    }
+
+
+def _normalize_quark_catalog_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _quark_catalog_defaults()
+    normalized.update(settings or {})
+    normalized['account_id'] = str(normalized.get('account_id') or '').strip()
+    normalized['root_fid'] = str(normalized.get('root_fid') or '0').strip() or '0'
+    normalized['root_folder_name'] = str(
+        normalized.get('root_folder_name') or ('根目录' if normalized['root_fid'] == '0' else '所选夸克文件夹')
+    ).strip()
+    normalized['catalog_scope'] = str(normalized.get('catalog_scope') or 'child_folders').strip()
+    if normalized['catalog_scope'] not in {'child_folders', 'selected_folder'}:
+        normalized['catalog_scope'] = 'child_folders'
+    if normalized['catalog_scope'] == 'selected_folder' and normalized['root_fid'] == '0':
+        raise HTTPException(status_code=400, detail='“所选目录作为一个商品”不能选择夸克网盘根目录')
+    for field in ('quark_cookie', 'text_api_key', 'image_api_key', 'text_base_url',
+                  'text_model', 'image_base_url', 'image_model', 'image_size', 'category_hint',
+                  'copy_background', 'pricing_strategy'):
+        normalized[field] = str(normalized.get(field) or '').strip()
+    normalized['copy_background'] = normalized['copy_background'][:500]
+    if not normalized['image_api_key']:
+        normalized['image_api_key'] = normalized['text_api_key']
+    if not normalized['image_base_url']:
+        normalized['image_base_url'] = normalized['text_base_url']
+    normalized['title_max_chars'] = max(12, min(int(normalized.get('title_max_chars') or 30), 60))
+    normalized['max_items_per_run'] = max(1, min(int(normalized.get('max_items_per_run') or 5), 30))
+    normalized['market_sample_size'] = max(3, min(int(normalized.get('market_sample_size') or 12), 30))
+    if normalized['pricing_strategy'] not in {'competitive', 'median', 'premium', 'traffic'}:
+        normalized['pricing_strategy'] = 'competitive'
+    normalized['run_hour'] = max(0, min(int(normalized.get('run_hour') or 0), 23))
+    normalized['random_delay_max'] = max(0, min(int(normalized.get('random_delay_max') or 0), 120))
+    normalized['auto_publish'] = bool(normalized.get('auto_publish'))
+    normalized['schedule_enabled'] = bool(normalized.get('schedule_enabled'))
+    normalized['market_research_enabled'] = bool(normalized.get('market_research_enabled'))
+    normalized['default_price'] = _parse_optional_non_negative_float(normalized.get('default_price'), '默认售价')
+    normalized['traffic_price'] = _parse_optional_non_negative_float(
+        normalized.get('traffic_price'), '拉新固定价'
+    )
+    if normalized['pricing_strategy'] == 'traffic':
+        if normalized['traffic_price'] is None or normalized['traffic_price'] < 0.01:
+            raise HTTPException(status_code=400, detail='拉新固定价必须至少为 0.01 元')
+    normalized['default_original_price'] = _parse_optional_non_negative_float(
+        normalized.get('default_original_price'), '默认原价'
+    )
+    if normalized['default_original_price'] is not None and normalized['default_price'] is None:
+        raise HTTPException(status_code=400, detail='填写默认原价时必须同时填写默认售价')
+    return normalized
+
+
+def _validate_quark_catalog_ready(settings: Dict[str, Any], *, require_account: bool = True) -> None:
+    required = {
+        'quark_cookie': '夸克 Cookie',
+        'text_base_url': '文案接口地址',
+        'text_api_key': '文案 API Key',
+        'text_model': '文案模型',
+        'image_base_url': '生图接口地址',
+        'image_api_key': '生图 API Key',
+        'image_model': '生图模型',
+    }
+    if require_account:
+        required['account_id'] = '闲鱼发布账号'
+    missing = [label for key, label in required.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(missing)}")
+
+
+def _validate_ai_product_creator_ready(settings: Dict[str, Any]) -> None:
+    required = {
+        'text_base_url': '文案接口地址',
+        'text_api_key': '文案 API Key',
+        'text_model': '文案模型',
+        'image_base_url': '生图接口地址',
+        'image_api_key': '生图 API Key',
+        'image_model': '生图模型',
+    }
+    missing = [label for key, label in required.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"请先在“夸克网盘 AI 自动上架”中保存：{'、'.join(missing)}",
+        )
+
+
+AI_PRODUCT_MAX_REFERENCE_IMAGES = 4
+AI_PRODUCT_MAX_REFERENCE_BYTES = 8 * 1024 * 1024
+
+
+def _normalize_ai_product_reference_images(images: List[Any]) -> List[Dict[str, Any]]:
+    if len(images or []) > AI_PRODUCT_MAX_REFERENCE_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"参考图最多上传 {AI_PRODUCT_MAX_REFERENCE_IMAGES} 张",
+        )
+
+    normalized: List[Dict[str, Any]] = []
+    for index, image in enumerate(images or [], start=1):
+        if not isinstance(image, dict):
+            raise HTTPException(status_code=400, detail=f"第 {index} 张参考图格式无效")
+        raw_value = next(
+            (image.get(key) for key in ('data', 'content', 'base64') if image.get(key)),
+            None,
+        )
+        if not raw_value:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张参考图缺少图片内容")
+
+        encoded = str(raw_value).strip()
+        if encoded.startswith('data:'):
+            header, separator, encoded = encoded.partition(',')
+            if not separator or ';base64' not in header.lower() or not header.lower().startswith('data:image/'):
+                raise HTTPException(status_code=400, detail=f"第 {index} 张参考图不是有效的 Base64 图片")
+        encoded = re.sub(r'\s+', '', encoded)
+        try:
+            raw_bytes = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张参考图 Base64 无效") from exc
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张参考图为空")
+        if len(raw_bytes) > AI_PRODUCT_MAX_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张参考图超过 8MB")
+
+        try:
+            jpeg_bytes, width, height = normalize_cover_image(raw_bytes)
+        except CatalogAIError as exc:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张参考图无效：{str(exc)}") from exc
+        filename = str(image.get('filename') or image.get('name') or f'reference-{index}.jpg').strip()
+        normalized.append({
+            'filename': filename[:180] or f'reference-{index}.jpg',
+            'data': f"data:image/jpeg;base64,{base64.b64encode(jpeg_bytes).decode('ascii')}",
+            'type': 'image/jpeg',
+            'size': len(jpeg_bytes),
+            'width': width,
+            'height': height,
+        })
+    return normalized
+
+
+def _sync_quark_catalog_schedule(user_id: int, settings: Dict[str, Any]) -> None:
+    account_id = str(settings.get('account_id') or '').strip()
+    if not account_id:
+        return
+    existing = db_manager.get_scheduled_task_by_account(
+        account_id,
+        user_id=user_id,
+        task_type='quark_catalog_sync',
+    )
+    enabled = bool(settings.get('schedule_enabled'))
+    task_data = {
+        'name': '夸克目录自动上架',
+        'enabled': 1 if enabled else 0,
+        'delay_minutes': int(settings.get('run_hour') or 0),
+        'random_delay_max': int(settings.get('random_delay_max') or 0),
+    }
+    if enabled:
+        task_data['next_run_at'] = db_manager.calculate_next_daily_run(
+            task_data['delay_minutes'], task_data['random_delay_max'], include_today=True
+        )
+    if existing:
+        db_manager.update_scheduled_task(existing['id'], **task_data)
+    elif enabled:
+        db_manager.create_scheduled_task(
+            task_data['name'], 'quark_catalog_sync', account_id, user_id=user_id,
+            interval_hours=24, delay_minutes=task_data['delay_minutes'],
+            random_delay_max=task_data['random_delay_max'], next_run_at=task_data.get('next_run_at'), enabled=1,
+        )
+
+
+def _quark_job_update(job_id: Optional[str], **updates: Any) -> None:
+    if not job_id:
+        return
+    job = QUARK_CATALOG_JOBS.get(job_id)
+    if not job:
+        return
+    job.update(updates)
+    job['updated_at'] = datetime.now().isoformat(timespec='seconds')
+
+
+def _unique_quark_title(user_id: int, quark_fid: str, proposed_title: str, max_chars: int) -> str:
+    if not db_manager.quark_catalog_title_exists(user_id, proposed_title, exclude_fid=quark_fid):
+        return proposed_title
+    suffix = f"-{str(quark_fid)[-4:]}"
+    return f"{proposed_title[:max(1, max_chars - len(suffix))]}{suffix}"
+
+
+def _quark_share_is_marked_permanent(item: Optional[Dict[str, Any]]) -> bool:
+    metadata = (item or {}).get('metadata') or {}
+    share_metadata = metadata.get('quark_share') or {}
+    try:
+        return int(share_metadata.get('expired_type')) == QUARK_SHARE_PERMANENT_EXPIRED_TYPE
+    except (TypeError, ValueError):
+        return False
+
+
+def _mark_quark_share_permanent(
+    metadata: Dict[str, Any],
+    share: Dict[str, Any],
+    *,
+    renewed: bool,
+) -> None:
+    metadata['quark_share'] = {
+        'share_id': share.get('share_id'),
+        'expired_type': QUARK_SHARE_PERMANENT_EXPIRED_TYPE,
+        'permanent': True,
+        'renewed_from_legacy_link': bool(renewed),
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+    }
+
+
+def _upsert_quark_delivery_assets(
+    *,
+    user_id: int,
+    folder: QuarkEntry,
+    existing: Optional[Dict[str, Any]],
+    title: str,
+    delivery_text: str,
+) -> Tuple[int, int]:
+    existing = existing or {}
+    card_id = existing.get('card_id')
+    card_name = f"夸克交付-{folder.fid[:12]}"
+    if card_id and db_manager.get_card_by_id(card_id, user_id):
+        if not db_manager.update_card(
+            card_id, name=card_name, card_type='text', text_content=delivery_text,
+            description=f"自动生成（永久分享）：{folder.name}", enabled=True,
+            user_id=user_id,
+        ):
+            raise RuntimeError('更新夸克自动发货卡券失败')
+    else:
+        card_id = db_manager.create_card(
+            card_name, 'text', text_content=delivery_text,
+            description=f"自动生成（永久分享）：{folder.name}", enabled=True,
+            user_id=user_id,
+        )
+
+    rule_id = existing.get('delivery_rule_id')
+    if rule_id and db_manager.get_delivery_rule_by_id(rule_id, user_id):
+        if not db_manager.update_delivery_rule(
+            rule_id, keyword=title, card_id=card_id, delivery_count=1,
+            enabled=True, description=f"夸克目录自动发货：{folder.name}",
+            user_id=user_id,
+        ):
+            raise RuntimeError('更新夸克自动发货规则失败')
+    else:
+        rule_id = db_manager.create_delivery_rule(
+            title, card_id, delivery_count=1, enabled=True,
+            description=f"夸克目录自动发货：{folder.name}", user_id=user_id,
+        )
+    if not card_id or not rule_id:
+        raise RuntimeError('创建自动发货卡券或规则失败')
+    return int(card_id), int(rule_id)
+
+
+async def _execute_quark_catalog_sync(
+    current_user: Dict[str, Any],
+    settings: Dict[str, Any],
+    request: QuarkCatalogSyncRequest,
+    job_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    settings = _normalize_quark_catalog_settings(settings)
+    _validate_quark_catalog_ready(settings)
+    _ensure_cookie_access(settings['account_id'], current_user)
+    xianyu_cookie = str(
+        _get_user_cookies_map(current_user).get(settings['account_id']) or ''
+    ).strip()
+
+    publish_enabled = settings['auto_publish'] if request.publish is None else bool(request.publish)
+    limit = request.max_items or settings['max_items_per_run']
+    limit = max(1, min(int(limit), 30))
+    counters = {
+        'total': 0, 'ready': 0, 'published': 0, 'skipped': 0,
+        'review_required': 0, 'market_researched': 0, 'market_failed': 0,
+        'share_renewed': 0, 'failed': 0,
+    }
+    errors: List[Dict[str, str]] = []
+    _quark_job_update(job_id, status='running', stage='连接夸克网盘', progress=2)
+
+    async with QuarkDriveClient(settings['quark_cookie']) as drive:
+        account_info = await drive.validate_account()
+        preloaded_children: Dict[str, List[QuarkEntry]] = {}
+        if settings['catalog_scope'] == 'selected_folder':
+            selected_children = await drive.list_entries(settings['root_fid'], max_items=80)
+            selected_folder = QuarkEntry(
+                fid=settings['root_fid'],
+                parent_fid='',
+                name=settings['root_folder_name'] or '所选夸克文件夹',
+                is_dir=True,
+                include_items=len(selected_children),
+            )
+            folders = [selected_folder]
+            preloaded_children[selected_folder.fid] = selected_children
+        else:
+            folders = await drive.list_entries(settings['root_fid'], max_items=limit, folders_only=True)
+        counters['total'] = len(folders)
+        scope_text = '所选目录作为 1 个商品' if settings['catalog_scope'] == 'selected_folder' else f'发现 {len(folders)} 个商品文件夹'
+        _quark_job_update(job_id, stage=scope_text, progress=5)
+
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'],
+            text_model=settings['text_model'], image_base_url=settings['image_base_url'],
+            image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            image_size=settings['image_size'],
+        ) as ai_client:
+            market_disabled_reason = ''
+            for index, folder in enumerate(folders, start=1):
+                existing = db_manager.get_quark_catalog_item(
+                    current_user['user_id'], folder.fid, include_secrets=True
+                )
+                try:
+                    _quark_job_update(
+                        job_id, stage=f'处理 {index}/{len(folders)}：{folder.name}',
+                        progress=5 + int((index - 1) / max(1, len(folders)) * 90),
+                    )
+                    children = (
+                        preloaded_children[folder.fid]
+                        if folder.fid in preloaded_children
+                        else await drive.list_entries(folder.fid, max_items=80)
+                    )
+                    fingerprint = build_folder_fingerprint(folder, children)
+                    metadata = dict((existing or {}).get('metadata') or {})
+                    metadata.update({
+                        'folder': folder.to_dict(),
+                        'children': [child.to_dict() for child in children],
+                    })
+                    db_manager.upsert_quark_catalog_item(current_user['user_id'], folder.fid, {
+                        'parent_fid': folder.parent_fid, 'folder_name': folder.name,
+                        'fingerprint': fingerprint, 'metadata_json': metadata,
+                        'status': (existing or {}).get('status') or 'discovered', 'error_message': None,
+                    })
+
+                    # Links created by versions before permanent-share support used
+                    # Quark's short-lived expiry type.  Upgrade those links before
+                    # the normal unchanged/published early exits and update the
+                    # linked delivery card in place so buyers never receive the old URL.
+                    legacy_share_needs_upgrade = bool(
+                        existing
+                        and existing.get('share_url')
+                        and not _quark_share_is_marked_permanent(existing)
+                        and existing.get('status') in {'ready', 'published', 'review_required'}
+                    )
+                    if legacy_share_needs_upgrade:
+                        _quark_job_update(
+                            job_id,
+                            stage=f'更新永久分享 {index}/{len(folders)}：{folder.name}',
+                        )
+                        renewed_share = await drive.create_share(folder)
+                        renewed_delivery_text = build_delivery_text(
+                            renewed_share['share_url'], renewed_share.get('passcode') or ''
+                        )
+                        renewed_card_id, renewed_rule_id = _upsert_quark_delivery_assets(
+                            user_id=current_user['user_id'], folder=folder, existing=existing,
+                            title=existing.get('title') or folder.name,
+                            delivery_text=renewed_delivery_text,
+                        )
+                        _mark_quark_share_permanent(metadata, renewed_share, renewed=True)
+                        if not db_manager.upsert_quark_catalog_item(
+                            current_user['user_id'], folder.fid, {
+                                'metadata_json': metadata,
+                                'share_id': renewed_share.get('share_id'),
+                                'share_url': renewed_share.get('share_url'),
+                                'share_password': renewed_share.get('passcode'),
+                                'card_id': renewed_card_id,
+                                'delivery_rule_id': renewed_rule_id,
+                                'error_message': None,
+                            },
+                        ):
+                            raise RuntimeError('保存夸克永久分享失败')
+                        existing = {
+                            **existing,
+                            'metadata': metadata,
+                            'share_id': renewed_share.get('share_id'),
+                            'share_url': renewed_share.get('share_url'),
+                            'share_password': renewed_share.get('passcode') or '',
+                            'card_id': renewed_card_id,
+                            'delivery_rule_id': renewed_rule_id,
+                        }
+                        counters['share_renewed'] += 1
+
+                    was_published = bool(existing and (
+                        existing.get('xianyu_item_id') or existing.get('status') == 'published'
+                    ))
+                    if was_published and existing.get('fingerprint') != fingerprint:
+                        db_manager.upsert_quark_catalog_item(current_user['user_id'], folder.fid, {
+                            'fingerprint': fingerprint, 'metadata_json': metadata,
+                            'status': 'review_required',
+                            'error_message': '已发布后源文件夹发生变化，请人工确认是否更新商品与分享内容',
+                        })
+                        counters['review_required'] += 1
+                        continue
+                    if existing and existing.get('fingerprint') == fingerprint and not request.force:
+                        if existing.get('status') == 'published':
+                            counters['skipped'] += 1
+                            continue
+                        if existing.get('status') == 'ready' and not publish_enabled:
+                            counters['skipped'] += 1
+                            continue
+                    if was_published:
+                        counters['skipped'] += 1
+                        continue
+
+                    market_summary: Dict[str, Any] = {
+                        'enabled': bool(settings['market_research_enabled']),
+                        'query': build_market_search_query(folder.name),
+                        'sample_count': 0,
+                        'price_count': 0,
+                        'pricing_strategy': settings['pricing_strategy'],
+                        'fixed_price': (
+                            settings['traffic_price']
+                            if settings['pricing_strategy'] == 'traffic'
+                            else None
+                        ),
+                    }
+                    if settings['market_research_enabled'] and market_disabled_reason:
+                        counters['market_failed'] += 1
+                        market_summary['error'] = market_disabled_reason
+                    elif settings['market_research_enabled']:
+                        _quark_job_update(
+                            job_id,
+                            stage=f'调研同款 {index}/{len(folders)}：{market_summary["query"]}',
+                        )
+                        try:
+                            from utils.item_search import search_xianyu_items
+
+                            search_result = await asyncio.wait_for(
+                                search_xianyu_items(
+                                    market_summary['query'], page=1,
+                                    page_size=settings['market_sample_size'],
+                                    cookie_id=settings['account_id'], cookie_value=xianyu_cookie,
+                                    max_retries=0,
+                                ),
+                                timeout=120,
+                            )
+                            if not search_result.get('is_real_data'):
+                                raise RuntimeError(search_result.get('error') or '未取得真实闲鱼搜索数据')
+                            market_summary = {
+                                'enabled': True,
+                                **summarize_market_items(
+                                    market_summary['query'], search_result.get('items') or [],
+                                    sample_size=settings['market_sample_size'],
+                                    pricing_strategy=settings['pricing_strategy'],
+                                ),
+                            }
+                            if settings['pricing_strategy'] == 'traffic':
+                                market_summary['fixed_price'] = settings['traffic_price']
+                            if market_summary.get('sample_count'):
+                                counters['market_researched'] += 1
+                            else:
+                                counters['market_failed'] += 1
+                                market_summary['error'] = '没有筛选出可靠的真实同类商品样本'
+                        except Exception as market_error:
+                            counters['market_failed'] += 1
+                            market_summary['error'] = mask_sensitive_text(str(market_error))
+                            normalized_market_error = market_summary['error'].lower()
+                            if any(marker in normalized_market_error for marker in (
+                                '验证码', '滑块', '登录', 'cookie', 'timeout', '超时', 'browser', '浏览器'
+                            )):
+                                market_disabled_reason = (
+                                    f"本轮市场搜索已停止，避免重复触发验证：{market_summary['error']}"
+                                )
+                            logger.warning(
+                                f"{get_user_log_prefix(current_user)} 市场调研失败，使用默认定价继续: "
+                                f"folder={folder.name}, error={market_summary['error']}"
+                            )
+
+                    listing = await ai_client.generate_listing(
+                        folder, children, title_max_chars=settings['title_max_chars'],
+                        market_summary=market_summary,
+                        copy_background=settings.get('copy_background') or '',
+                    )
+                    listing['title'] = _unique_quark_title(
+                        current_user['user_id'], folder.fid, listing['title'], settings['title_max_chars']
+                    )
+                    if settings['pricing_strategy'] == 'traffic':
+                        selected_price = settings['traffic_price']
+                        selected_original_price = None
+                        listing['pricing_basis'] = '拉新引流固定价'
+                    else:
+                        selected_price = (
+                            choose_listing_price(
+                                listing.get('suggested_price'), market_summary, settings['default_price']
+                            )
+                            if settings['market_research_enabled']
+                            else settings['default_price']
+                        )
+                        selected_original_price = settings['default_original_price']
+                    if (
+                        selected_price is not None and selected_original_price is not None
+                        and selected_original_price <= selected_price
+                    ):
+                        selected_original_price = None
+                    metadata['market_research'] = market_summary
+                    metadata['selected_price'] = selected_price
+                    metadata['pricing_basis'] = listing.get('pricing_basis') or ''
+                    cover = await ai_client.generate_cover(listing['cover_prompt'])
+
+                    share = None
+                    replacing_legacy_share = False
+                    if (
+                        existing
+                        and existing.get('share_url')
+                        and _quark_share_is_marked_permanent(existing)
+                    ):
+                        share = {
+                            'share_id': existing.get('share_id'), 'share_url': existing.get('share_url'),
+                            'passcode': existing.get('share_password') or '',
+                            'expired_type': QUARK_SHARE_PERMANENT_EXPIRED_TYPE,
+                            'permanent': True,
+                        }
+                    if not share:
+                        replacing_legacy_share = bool(existing and existing.get('share_url'))
+                        share = await drive.create_share(folder)
+                        if replacing_legacy_share:
+                            counters['share_renewed'] += 1
+                    _mark_quark_share_permanent(
+                        metadata, share,
+                        renewed=replacing_legacy_share,
+                    )
+                    delivery_text = build_delivery_text(
+                        share['share_url'], share.get('passcode') or ''
+                    )
+
+                    material_data = {
+                        'title': listing['title'], 'description': listing['description'],
+                        'price': selected_price, 'original_price': selected_original_price,
+                        'category': settings['category_hint'],
+                        'images': [{
+                            'content': cover['content'], 'filename': cover['filename'],
+                            'width': cover['width'], 'height': cover['height'],
+                        }],
+                        'delivery_method': '无需邮寄', 'postage': 0, 'can_self_pickup': False,
+                        'condition': '全新',
+                        'remark': json.dumps({
+                            'source': 'quark_catalog', 'quark_fid': folder.fid,
+                            'folder_name': folder.name, 'fingerprint': fingerprint,
+                            'market_query': market_summary.get('query'),
+                            'market_sample_count': market_summary.get('sample_count'),
+                            'selected_price': selected_price,
+                        }, ensure_ascii=False),
+                    }
+                    material_id = (existing or {}).get('material_id')
+                    if material_id and db_manager.get_product_material(material_id, current_user['user_id']):
+                        db_manager.update_product_material(material_id, current_user['user_id'], material_data)
+                    else:
+                        material_id = db_manager.add_product_material(current_user['user_id'], material_data)
+                    if not material_id:
+                        raise RuntimeError('保存商品素材失败')
+
+                    card_id, rule_id = _upsert_quark_delivery_assets(
+                        user_id=current_user['user_id'], folder=folder, existing=existing,
+                        title=listing['title'], delivery_text=delivery_text,
+                    )
+
+                    db_manager.upsert_quark_catalog_item(current_user['user_id'], folder.fid, {
+                        'fingerprint': fingerprint, 'metadata_json': metadata,
+                        'share_id': share.get('share_id'), 'share_url': share.get('share_url'),
+                        'share_password': share.get('passcode'), 'title': listing['title'],
+                        'description': listing['description'], 'cover_sha256': cover['sha256'],
+                        'material_id': material_id, 'card_id': card_id, 'delivery_rule_id': rule_id,
+                        'status': 'ready', 'error_message': None,
+                    })
+                    counters['ready'] += 1
+
+                    if publish_enabled:
+                        publish_result = await _publish_product_to_account(
+                            current_user=current_user, account_id=settings['account_id'],
+                            title=listing['title'], description=listing['description'],
+                            images=material_data['images'], current_price=selected_price,
+                            original_price=selected_original_price, delivery_choice='无需邮寄',
+                            post_price=0, can_self_pickup=False, category_hint=settings['category_hint'],
+                            material_id=material_id, batch_id=f"quark_catalog_{job_id or uuid.uuid4()}",
+                        )
+                        db_manager.upsert_quark_catalog_item(current_user['user_id'], folder.fid, {
+                            'publish_log_id': publish_result.get('log_id'),
+                            'xianyu_item_id': publish_result.get('published_item_id'),
+                            'status': 'published', 'error_message': None,
+                        })
+                        counters['published'] += 1
+                except Exception as exc:
+                    if isinstance(exc, QuarkDriveError) and exc.auth_expired:
+                        raise
+                    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                    safe_error = mask_sensitive_text(detail)
+                    counters['failed'] += 1
+                    errors.append({'quark_fid': folder.fid, 'folder_name': folder.name, 'error': safe_error})
+                    db_manager.upsert_quark_catalog_item(current_user['user_id'], folder.fid, {
+                        'parent_fid': folder.parent_fid, 'folder_name': folder.name,
+                        'status': 'failed', 'error_message': safe_error,
+                    })
+                    logger.warning(
+                        f"{get_user_log_prefix(current_user)} 夸克目录处理失败: folder={folder.name}, error={safe_error}"
+                    )
+
+    result = {
+        'success': counters['failed'] == 0,
+        'message': (
+            f"同步完成：发现 {counters['total']}，素材就绪 {counters['ready']}，"
+            f"已发布 {counters['published']}，跳过 {counters['skipped']}，"
+            f"永久链接更新 {counters['share_renewed']}，"
+            f"市场调研成功 {counters['market_researched']}，调研降级 {counters['market_failed']}，"
+            f"待复核 {counters['review_required']}，失败 {counters['failed']}"
+        ),
+        'quark_account': account_info, 'publish_enabled': publish_enabled,
+        **counters, 'errors': errors,
+    }
+    _quark_job_update(job_id, status='completed', stage='完成', progress=100, result=result)
+    return result
+
+
+async def _run_quark_catalog_job(
+    job_id: str,
+    current_user: Dict[str, Any],
+    settings: Dict[str, Any],
+    request: QuarkCatalogSyncRequest,
+) -> None:
+    try:
+        await _execute_quark_catalog_sync(current_user, settings, request, job_id=job_id)
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        _quark_job_update(job_id, status='failed', stage='失败', progress=100, error=mask_sensitive_text(detail))
+        logger.error(f"{get_user_log_prefix(current_user)} 夸克目录任务失败: {mask_sensitive_text(detail)}")
+
+
+@app.get('/quark-catalog/settings')
+def get_quark_catalog_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
+    stored = db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=False)
+    return {'success': True, 'settings': {**_quark_catalog_defaults(), **stored}}
+
+
+@app.put('/quark-catalog/settings')
+def save_quark_catalog_settings(
+    request: QuarkCatalogSettingsRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    payload = _model_to_dict(request, exclude_unset=True)
+    if payload.get('account_id'):
+        _ensure_cookie_access(payload['account_id'], current_user)
+    existing = db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    candidate = dict(existing)
+    for key, value in payload.items():
+        if key in {'quark_cookie', 'text_api_key', 'image_api_key'} and not str(value or '').strip():
+            continue
+        candidate[key] = value
+    candidate = _normalize_quark_catalog_settings(candidate)
+    if candidate.get('schedule_enabled'):
+        _validate_quark_catalog_ready(candidate)
+    if not db_manager.save_quark_catalog_settings(current_user['user_id'], payload):
+        raise HTTPException(status_code=500, detail='保存夸克自动上架配置失败')
+    saved = _normalize_quark_catalog_settings(
+        db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    )
+    if saved.get('account_id'):
+        _ensure_cookie_access(saved['account_id'], current_user)
+    _sync_quark_catalog_schedule(current_user['user_id'], saved)
+    masked = db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=False)
+    return {'success': True, 'message': '配置已加密保存', 'settings': {**_quark_catalog_defaults(), **masked}}
+
+
+@app.post('/quark-catalog/test')
+async def test_quark_catalog(current_user: Dict[str, Any] = Depends(get_current_user)):
+    settings = _normalize_quark_catalog_settings(
+        db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    )
+    if not settings.get('quark_cookie'):
+        raise HTTPException(status_code=400, detail='请先保存夸克 Cookie')
+    try:
+        async with QuarkDriveClient(settings['quark_cookie']) as drive:
+            account = await drive.validate_account()
+            folders = await drive.list_entries(settings['root_fid'], max_items=10, folders_only=True)
+        return {
+            'success': True, 'message': f"连接成功，目录下发现 {len(folders)} 个文件夹",
+            'account': account,
+            'folders': [{'fid': item.fid, 'name': item.name, 'include_items': item.include_items} for item in folders],
+        }
+    except QuarkDriveError as exc:
+        # 401 is reserved for this application's own login session.  Upstream
+        # Quark authentication failures are dependency errors with a readable detail.
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post('/quark-catalog/folders')
+async def list_quark_catalog_folders(
+    request: QuarkFolderListRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """List direct child folders for the visual Quark folder picker."""
+    stored = db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    cookie = str(request.quark_cookie or stored.get('quark_cookie') or '').strip()
+    if not cookie:
+        raise HTTPException(status_code=400, detail='请先填写或保存夸克 Cookie')
+    parent_fid = str(request.parent_fid or '0').strip() or '0'
+    try:
+        async with QuarkDriveClient(cookie) as drive:
+            folders = await drive.list_entries(parent_fid, max_items=200, folders_only=True)
+        return {
+            'success': True,
+            'parent_fid': parent_fid,
+            'folders': [
+                {
+                    'fid': item.fid,
+                    'parent_fid': item.parent_fid,
+                    'name': item.name,
+                    'include_items': item.include_items,
+                }
+                for item in folders
+            ],
+        }
+    except QuarkDriveError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post('/quark-catalog/sync')
+async def start_quark_catalog_sync(
+    request: QuarkCatalogSyncRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    settings = _normalize_quark_catalog_settings(
+        db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    )
+    _validate_quark_catalog_ready(settings)
+    _ensure_cookie_access(settings['account_id'], current_user)
+    running = [
+        job for job in QUARK_CATALOG_JOBS.values()
+        if job.get('user_id') == current_user['user_id'] and job.get('status') in {'pending', 'running'}
+    ]
+    if running:
+        raise HTTPException(status_code=409, detail=f"已有任务运行中：{running[0]['job_id']}")
+    job_id = f"quark_{uuid.uuid4()}"
+    QUARK_CATALOG_JOBS[job_id] = {
+        'job_id': job_id, 'user_id': current_user['user_id'], 'status': 'pending',
+        'stage': '等待执行', 'progress': 0, 'created_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    background_tasks.add_task(_run_quark_catalog_job, job_id, dict(current_user), settings, request)
+    return {'success': True, 'message': '夸克目录同步任务已启动', 'job_id': job_id}
+
+
+@app.get('/quark-catalog/jobs/{job_id}')
+def get_quark_catalog_job(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    job = QUARK_CATALOG_JOBS.get(job_id)
+    if not job or job.get('user_id') != current_user['user_id']:
+        raise HTTPException(status_code=404, detail='任务不存在')
+    return {'success': True, 'job': job}
+
+
+@app.get('/quark-catalog/items')
+def list_quark_catalog_items(
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    return {
+        'success': True,
+        **db_manager.list_quark_catalog_items(current_user['user_id'], page=page, page_size=page_size),
+    }
+
+
+@app.get('/quark-catalog/items/{quark_fid}/preview')
+def get_quark_catalog_item_preview(
+    quark_fid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    item = db_manager.get_quark_catalog_item(current_user['user_id'], quark_fid)
+    if not item:
+        raise HTTPException(status_code=404, detail='夸克目录商品不存在')
+    material_id = item.get('material_id')
+    if not material_id:
+        raise HTTPException(
+            status_code=409,
+            detail=item.get('error_message') or '该目录尚未生成可预览的商品素材',
+        )
+    material = db_manager.get_product_material(material_id, current_user['user_id'])
+    if not material:
+        raise HTTPException(status_code=404, detail='关联的商品素材不存在')
+    return {'success': True, 'item': item, 'material': material}
+
+
+@app.post('/quark-catalog/items/{quark_fid}/cover')
+async def regenerate_quark_catalog_cover(
+    quark_fid: str,
+    request: QuarkCatalogCoverRegenerateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """按用户补充的视觉要求重新生成目录商品封面，并保留其他详情图。"""
+    item = db_manager.get_quark_catalog_item(current_user['user_id'], quark_fid)
+    if not item:
+        raise HTTPException(status_code=404, detail='夸克目录商品不存在')
+    material_id = item.get('material_id')
+    material = db_manager.get_product_material(material_id, current_user['user_id']) if material_id else None
+    if not material:
+        raise HTTPException(status_code=409, detail='该目录尚未生成可编辑的商品素材')
+
+    suggestion = str(request.suggestion or '').strip()
+    if len(suggestion) > 1000:
+        raise HTTPException(status_code=400, detail='封面建议最多 1000 个字')
+
+    title = str(request.title or material.get('title') or '').strip()
+    description = str(request.description or material.get('description') or '').strip()
+    if not title or not description:
+        raise HTTPException(status_code=400, detail='商品标题和详细介绍不能为空')
+
+    settings = _normalize_quark_catalog_settings(
+        db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    )
+    image_missing = [
+        label for key, label in (
+            ('image_base_url', '生图接口地址'),
+            ('image_api_key', '生图 API Key'),
+            ('image_model', '生图模型'),
+        ) if not str(settings.get(key) or '').strip()
+    ]
+    if image_missing:
+        raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(image_missing)}")
+
+    prompt = (
+        "为闲鱼数字资料商品生成一张方形中文商品封面。"
+        "画面要在手机列表缩略图中一眼看懂，主体突出、层次清楚、颜色有对比、留白适合展示标题。"
+        "不要出现平台 Logo、品牌仿冒、二维码、联系方式、水印、虚假收益承诺或密集小字；"
+        "若需要文字，只放少量清晰的大字，优先保证画面信息可读。\n"
+        f"商品标题：{title[:120]}\n"
+        f"商品介绍：{description[:1800]}\n"
+        f"卖家对封面的补充要求：{suggestion or '请根据商品内容设计更有吸引力、真实可信的封面'}"
+    )
+
+    try:
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'],
+            text_api_key=settings['text_api_key'],
+            text_model=settings['text_model'],
+            image_base_url=settings['image_base_url'],
+            image_api_key=settings['image_api_key'],
+            image_model=settings['image_model'],
+            image_size=settings['image_size'],
+            timeout_seconds=150,
+        ) as ai_client:
+            cover = await ai_client.generate_cover(prompt)
+    except CatalogAIError as exc:
+        logger.warning(
+            f"{get_user_log_prefix(current_user)} 夸克商品封面重新生成失败: "
+            f"fid={quark_fid}, error={mask_sensitive_text(exc)}"
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    existing_images = material.get('images') if isinstance(material.get('images'), list) else []
+    images = list(existing_images)
+    new_cover = {
+        'content': cover['content'],
+        'filename': cover.get('filename') or 'quark_catalog_cover.jpg',
+        'width': cover['width'],
+        'height': cover['height'],
+    }
+    if images:
+        images[0] = new_cover
+    else:
+        images = [new_cover]
+    if not db_manager.update_product_material(
+        material_id, current_user['user_id'], {'images': images}
+    ):
+        raise HTTPException(status_code=500, detail='保存新封面失败')
+
+    updated_material = db_manager.get_product_material(material_id, current_user['user_id'])
+    return {
+        'success': True,
+        'message': '新封面已生成并替换首图；保存修改不会自动发布',
+        'material': updated_material,
+        'cover_prompt': prompt,
+    }
+
+
+@app.put('/quark-catalog/items/{quark_fid}')
+def update_quark_catalog_item_material(
+    quark_fid: str,
+    request: QuarkCatalogItemUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    item = db_manager.get_quark_catalog_item(current_user['user_id'], quark_fid)
+    if not item:
+        raise HTTPException(status_code=404, detail='夸克目录商品不存在')
+    material_id = item.get('material_id')
+    material = db_manager.get_product_material(material_id, current_user['user_id']) if material_id else None
+    if not material:
+        raise HTTPException(status_code=409, detail='该目录尚未生成可编辑的商品素材')
+
+    payload = _model_to_dict(request, exclude_unset=True)
+    if not payload:
+        raise HTTPException(status_code=400, detail='没有可更新的字段')
+    merged = dict(material)
+    merged.update(payload)
+    normalized = _normalize_product_publish_data(merged, partial=False)
+    material_updates = {
+        key: normalized.get(key)
+        for key in ('title', 'description', 'price', 'original_price', 'category')
+        if key in payload
+    }
+    if not db_manager.update_product_material(
+        material_id, current_user['user_id'], material_updates
+    ):
+        raise HTTPException(status_code=500, detail='更新商品素材失败')
+
+    metadata = dict(item.get('metadata') or {})
+    if 'price' in payload:
+        metadata['selected_price'] = normalized.get('price')
+        metadata['pricing_basis'] = '人工调整'
+    catalog_updates: Dict[str, Any] = {'metadata_json': metadata}
+    if 'title' in payload:
+        catalog_updates['title'] = normalized.get('title')
+    if 'description' in payload:
+        catalog_updates['description'] = normalized.get('description')
+    if not db_manager.upsert_quark_catalog_item(
+        current_user['user_id'], quark_fid, catalog_updates
+    ):
+        raise HTTPException(status_code=500, detail='同步夸克商品记录失败')
+
+    if 'title' in payload and item.get('delivery_rule_id'):
+        db_manager.update_delivery_rule(
+            item['delivery_rule_id'], keyword=normalized.get('title'),
+            user_id=current_user['user_id'],
+        )
+
+    return {
+        'success': True,
+        'message': '商品素材已更新，可载入发布表单检查后发布',
+        'item': db_manager.get_quark_catalog_item(current_user['user_id'], quark_fid),
+        'material': db_manager.get_product_material(material_id, current_user['user_id']),
+    }
+
+
+@app.delete('/quark-catalog/items/{quark_fid}/material')
+def reset_quark_catalog_item_material(
+    quark_fid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    item = db_manager.get_quark_catalog_item(current_user['user_id'], quark_fid)
+    if not item:
+        raise HTTPException(status_code=404, detail='夸克目录商品不存在')
+    if item.get('xianyu_item_id') or item.get('status') == 'published':
+        raise HTTPException(status_code=409, detail='该商品已经发布，不能删除本地生成素材')
+    try:
+        deleted = db_manager.reset_quark_catalog_item_material(
+            current_user['user_id'], quark_fid
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=500, detail='删除商品生成素材失败')
+    return {
+        'success': True,
+        'message': '生成结果已删除；再次点击“生成素材”即可重新生成，本次不会被跳过',
+        'item': db_manager.get_quark_catalog_item(current_user['user_id'], quark_fid),
+    }
+
+
+@app.delete('/quark-catalog/items/{quark_fid}')
+def delete_quark_catalog_item(
+    quark_fid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    item = db_manager.get_quark_catalog_item(current_user['user_id'], quark_fid)
+    if not item:
+        raise HTTPException(status_code=404, detail='夸克目录记录不存在')
+
+    deleted = db_manager.delete_quark_catalog_item(current_user['user_id'], quark_fid)
+    if not deleted:
+        raise HTTPException(status_code=500, detail='删除夸克目录记录失败')
+
+    published_note = '已发布的闲鱼商品不受影响。' if item.get('xianyu_item_id') else ''
+    return {
+        'success': True,
+        'message': f"夸克目录记录已删除。{published_note}",
+        'quark_fid': quark_fid,
+    }
+
+
+@app.post('/ai-product-creator/generate')
+async def generate_ai_product_material(
+    request: AIProductCreatorRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Create an editable product material from text and optional reference images."""
+    brief = str(request.description or '').strip()
+    if len(brief) < 4:
+        raise HTTPException(status_code=400, detail='请至少用 4 个字描述要上架的商品')
+    if len(brief) > 5000:
+        raise HTTPException(status_code=400, detail='商品需求描述最多 5000 字')
+
+    settings = _normalize_quark_catalog_settings(
+        db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    )
+    _validate_ai_product_creator_ready(settings)
+    reference_images = _normalize_ai_product_reference_images(request.reference_images or [])
+    price_hint = _parse_optional_non_negative_float(request.price_hint, '价格提示')
+    original_price_hint = _parse_optional_non_negative_float(request.original_price_hint, '原价提示')
+    if original_price_hint is not None and price_hint is None:
+        raise HTTPException(status_code=400, detail='填写原价提示时必须同时填写价格提示')
+
+    delivery_method = str(request.delivery_method or '包邮').strip() or '包邮'
+    if delivery_method not in PRODUCT_PUBLISH_DELIVERY_CHOICES:
+        raise HTTPException(status_code=400, detail='不支持的运费方式')
+
+    account_id = str(request.account_id or settings.get('account_id') or '').strip()
+    if account_id:
+        _ensure_cookie_access(account_id, current_user)
+    market_enabled = (
+        bool(settings.get('market_research_enabled'))
+        if request.market_research is None
+        else bool(request.market_research)
+    )
+    query_source = (
+        str(request.market_query or '').strip()
+        or str(request.category_hint or '').strip()
+        or brief.splitlines()[0]
+    )
+    market_query = build_market_search_query(query_source)
+    market_summary: Dict[str, Any] = {
+        'enabled': market_enabled,
+        'query': market_query,
+        'sample_count': 0,
+        'price_count': 0,
+        'pricing_strategy': settings.get('pricing_strategy') or 'competitive',
+        'fixed_price': (
+            settings.get('traffic_price')
+            if settings.get('pricing_strategy') == 'traffic'
+            else None
+        ),
+    }
+    warnings: List[str] = []
+    if market_enabled and not account_id:
+        market_summary['error'] = '未选择闲鱼账号，已跳过同款调研'
+        warnings.append(market_summary['error'])
+    elif market_enabled:
+        cookies_str = str(_get_user_cookies_map(current_user).get(account_id) or '').strip()
+        if not cookies_str:
+            market_summary['error'] = '所选账号 Cookie 为空，已跳过同款调研'
+            warnings.append(market_summary['error'])
+        else:
+            try:
+                from utils.item_search import search_xianyu_items
+
+                search_result = await asyncio.wait_for(
+                    search_xianyu_items(
+                        market_query,
+                        page=1,
+                        page_size=settings['market_sample_size'],
+                        cookie_id=account_id,
+                        cookie_value=cookies_str,
+                        max_retries=0,
+                    ),
+                    timeout=120,
+                )
+                if not search_result.get('is_real_data'):
+                    raise RuntimeError(search_result.get('error') or '未取得真实闲鱼搜索数据')
+                market_summary = {
+                    'enabled': True,
+                    **summarize_market_items(
+                        market_query,
+                        search_result.get('items') or [],
+                        sample_size=settings['market_sample_size'],
+                        pricing_strategy=settings['pricing_strategy'],
+                    ),
+                }
+                if settings.get('pricing_strategy') == 'traffic':
+                    market_summary['fixed_price'] = settings.get('traffic_price')
+                if not market_summary.get('sample_count'):
+                    warnings.append('未筛选出可靠的真实同款样本，文案将按你的描述生成')
+            except Exception as exc:
+                market_summary['error'] = mask_sensitive_text(str(exc))
+                warnings.append(f"同款调研失败，已继续生成：{market_summary['error']}")
+                logger.warning(
+                    f"{get_user_log_prefix(current_user)} AI 商品创作市场调研失败: "
+                    f"query={market_query}, error={market_summary['error']}"
+                )
+
+    try:
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'],
+            text_api_key=settings['text_api_key'],
+            text_model=settings['text_model'],
+            image_base_url=settings['image_base_url'],
+            image_api_key=settings['image_api_key'],
+            image_model=settings['image_model'],
+            image_size=settings['image_size'],
+            timeout_seconds=150,
+        ) as ai_client:
+            listing = await ai_client.generate_product_draft(
+                brief,
+                reference_images=[image['data'] for image in reference_images],
+                category_hint=str(request.category_hint or settings.get('category_hint') or '').strip(),
+                price_hint=price_hint,
+                market_summary=market_summary,
+                title_max_chars=settings['title_max_chars'],
+            )
+            cover = await ai_client.generate_cover(listing['cover_prompt'])
+    except CatalogAIError as exc:
+        logger.warning(
+            f"{get_user_log_prefix(current_user)} AI 商品创作失败: {mask_sensitive_text(exc)}"
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    warnings.extend(listing.get('warnings') or [])
+    ai_price = parse_market_price(listing.get('suggested_price'))
+    if price_hint is not None:
+        selected_price = price_hint
+        pricing_basis = '采用你填写的价格提示'
+    elif settings.get('pricing_strategy') == 'traffic':
+        selected_price = settings.get('traffic_price')
+        pricing_basis = '采用已配置的拉新引流固定价'
+    elif market_summary.get('price_count'):
+        selected_price = choose_listing_price(
+            listing.get('suggested_price'), market_summary, settings.get('default_price')
+        )
+        pricing_basis = listing.get('pricing_basis') or '参考同款公开价格区间'
+    else:
+        selected_price = ai_price if ai_price is not None else settings.get('default_price')
+        pricing_basis = listing.get('pricing_basis') or '根据商品描述给出建议价'
+
+    selected_original_price = (
+        original_price_hint
+        if original_price_hint is not None
+        else settings.get('default_original_price')
+    )
+    if (
+        selected_original_price is not None
+        and selected_price is not None
+        and selected_original_price <= selected_price
+    ):
+        selected_original_price = None
+        warnings.append('原价未高于现价，已自动留空')
+
+    cover_image = {
+        'content': cover['content'],
+        'filename': 'ai_product_cover.jpg',
+        'width': cover['width'],
+        'height': cover['height'],
+    }
+    images: List[Dict[str, Any]] = [cover_image, *reference_images]
+    category = str(request.category_hint or listing.get('category') or settings.get('category_hint') or '').strip()
+    material_data = _normalize_product_publish_data({
+        'title': listing['title'],
+        'description': listing['description'],
+        'price': selected_price,
+        'original_price': selected_original_price,
+        'category': category,
+        'images': images,
+        'delivery_method': delivery_method,
+        'postage': 0,
+        'can_self_pickup': False,
+        'condition': '全新',
+        'remark': json.dumps({
+            'source': 'ai_product_creator',
+            'brief': brief[:1000],
+            'reference_image_count': len(reference_images),
+            'reference_images_analyzed': bool(listing.get('reference_images_analyzed')),
+            'market_query': market_summary.get('query'),
+            'market_sample_count': market_summary.get('sample_count'),
+            'pricing_basis': pricing_basis,
+        }, ensure_ascii=False),
+    }, partial=False)
+    material_id = db_manager.add_product_material(current_user['user_id'], material_data)
+    if not material_id:
+        raise HTTPException(status_code=500, detail='AI 内容已生成，但保存商品素材失败')
+    material = db_manager.get_product_material(material_id, current_user['user_id'])
+    return {
+        'success': True,
+        'message': 'AI 商品素材已生成并载入可编辑发布表单',
+        'material': material,
+        'reference_images_analyzed': bool(listing.get('reference_images_analyzed')),
+        'pricing_basis': pricing_basis,
+        'market_research': market_summary,
+        'warnings': warnings,
+    }
+
+
+def _content_product_public_view(product: Optional[Dict[str, Any]], user_id: int) -> Optional[Dict[str, Any]]:
+    if not product:
+        return None
+    result = dict(product)
+    package_zip = str(result.pop('package_zip', '') or '')
+    result.pop('package_dir', None)
+    result['download_url'] = f"/content-products/{int(result['id'])}/download" if package_zip else None
+    if result.get('material_id'):
+        result['material'] = db_manager.get_product_material(int(result['material_id']), user_id)
+    return result
+
+
+def _upsert_content_delivery_assets(
+    *,
+    user_id: int,
+    product_id: int,
+    title: str,
+    delivery_text: str,
+    existing_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    """Create/update the text card and title rule used by automatic delivery."""
+    clean_text = str(delivery_text or '').strip()
+    if not clean_text:
+        return {}
+    metadata = dict(existing_metadata or {})
+    delivery_meta = dict(metadata.get('delivery') or {})
+    card_id = delivery_meta.get('card_id')
+    rule_id = delivery_meta.get('rule_id')
+    card_name = f'内容商品交付-{int(product_id)}'
+    if card_id and db_manager.get_card_by_id(int(card_id), user_id):
+        if not db_manager.update_card(
+            int(card_id), name=card_name, card_type='text', text_content=clean_text,
+            description=f'内容商品自动发货：{str(title or "")[:80]}', enabled=True, user_id=user_id,
+        ):
+            raise RuntimeError('更新内容商品自动发货卡券失败')
+    else:
+        card_id = db_manager.create_card(
+            card_name, 'text', text_content=clean_text,
+            description=f'内容商品自动发货：{str(title or "")[:80]}', enabled=True, user_id=user_id,
+        )
+    if not card_id:
+        raise RuntimeError('创建内容商品自动发货卡券失败')
+
+    if rule_id and db_manager.get_delivery_rule_by_id(int(rule_id), user_id):
+        if not db_manager.update_delivery_rule(
+            int(rule_id), keyword=str(title or '').strip(), card_id=int(card_id), delivery_count=1,
+            enabled=True, description=f'内容商品自动发货：{int(product_id)}', user_id=user_id,
+        ):
+            raise RuntimeError('更新内容商品自动发货规则失败')
+    else:
+        rule_id = db_manager.create_delivery_rule(
+            str(title or '').strip(), int(card_id), delivery_count=1, enabled=True,
+            description=f'内容商品自动发货：{int(product_id)}', user_id=user_id,
+        )
+    if not rule_id:
+        raise RuntimeError('创建内容商品自动发货规则失败')
+    return {'card_id': int(card_id), 'rule_id': int(rule_id)}
+
+
+def _sync_content_product_before_publish(
+    *,
+    user_id: int,
+    material_id: Optional[int],
+    title: str,
+    description: str,
+    price: Optional[float],
+    original_price: Optional[float],
+    category: Optional[str],
+) -> None:
+    """Keep a generated product record/rule aligned with final form edits."""
+    if not material_id:
+        return
+    material = db_manager.get_product_material(int(material_id), user_id)
+    if not material:
+        return
+    try:
+        material_meta = json.loads(str(material.get('remark') or '{}'))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    product_id = material_meta.get('content_product_id')
+    if not product_id:
+        return
+    product = db_manager.get_content_product(int(product_id), user_id)
+    if not product:
+        return
+    delivery = (product.get('metadata') or {}).get('delivery') or {}
+    rule_id = delivery.get('rule_id')
+    if rule_id:
+        if not db_manager.update_delivery_rule(
+            int(rule_id), keyword=str(title or '').strip(), enabled=True, user_id=user_id,
+        ):
+            raise RuntimeError('同步内容商品自动发货规则标题失败')
+    db_manager.update_content_product(user_id=user_id, product_id=int(product_id), data={
+        'title': str(title or '').strip(),
+        'description': str(description or '').strip(),
+        'category': category,
+        'price': price,
+        'original_price': original_price,
+    })
+
+
+@app.post('/content-products/generate')
+async def generate_content_product(
+    request: ContentProductGenerateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Turn a public link or pasted long-form text into an editable listing and export package."""
+    output_mode = str(request.output_mode or 'bundle').strip().lower()
+    if output_mode not in {'document', 'skill', 'bundle'}:
+        raise HTTPException(status_code=400, detail='输出形式请选择 document、skill 或 bundle')
+    rights_status = str(request.rights_status or 'reference_only').strip().lower()
+    if rights_status not in {'self_owned', 'licensed', 'public_domain', 'reference_only'}:
+        raise HTTPException(status_code=400, detail='来源状态不受支持')
+    if request.publish_after_review and rights_status == 'reference_only':
+        raise HTTPException(status_code=400, detail='一键上架前请先确认来源状态，并完成人工复核')
+    source_url = str(request.source_url or '').strip()
+    if source_url:
+        try:
+            source_url = validate_source_url(source_url)
+        except ContentProductError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    fetched = None
+    fetch_warning = ''
+    if source_url:
+        try:
+            fetched = await fetch_content_source(source_url)
+        except ContentProductError as exc:
+            fetch_warning = str(exc)
+            if not str(request.source_text or '').strip():
+                raise HTTPException(status_code=422, detail=f'{fetch_warning}；也可以直接粘贴正文继续') from exc
+
+    try:
+        source = merge_source(source_url, str(request.source_text or ''), fetched)
+    except ContentProductError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Reuse the existing market-aware title/description/cover flow.  The full
+    # source remains in the export; the model receives a bounded excerpt.
+    ai_request = AIProductCreatorRequest(
+        description=source.text[:5000],
+        account_id=request.account_id,
+        category_hint=request.category_hint,
+        market_query=request.market_query or source.title,
+        market_research=request.market_research,
+        price_hint=request.price_hint,
+        original_price_hint=request.original_price_hint,
+        delivery_method=request.delivery_method or '无需邮寄',
+    )
+    try:
+        generated = await generate_ai_product_material(ai_request, current_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception('链接商品化 AI 生成失败')
+        raise HTTPException(status_code=502, detail=f'内容商品化生成失败：{mask_sensitive_text(exc)}') from exc
+
+    material = generated.get('material') or {}
+    listing = {
+        'title': material.get('title') or source.title,
+        'description': material.get('description') or '',
+        'category': material.get('category') or request.category_hint or '',
+        'suggested_price': material.get('price'),
+        'original_price': material.get('original_price'),
+        'cover_prompt': '',
+    }
+    status_value = 'review_required' if rights_status == 'reference_only' else 'ready'
+    product_id = db_manager.add_content_product(current_user['user_id'], {
+        'source_url': source.url,
+        'source_title': source.title,
+        'source_excerpt': source.excerpt,
+        'rights_status': rights_status,
+        'output_mode': output_mode,
+        'title': listing['title'],
+        'description': listing['description'],
+        'category': listing['category'],
+        'price': listing['suggested_price'],
+        'original_price': listing['original_price'],
+        'material_id': material.get('id'),
+        'status': 'packaging',
+        'metadata': {
+            'fetched': bool(source.fetched),
+            'fetch_warning': fetch_warning,
+            'market_research': generated.get('market_research') or {},
+            'warnings': generated.get('warnings') or [],
+            'delivery_text_provided': bool(str(request.delivery_text or '').strip()),
+        },
+    })
+    if not product_id:
+        raise HTTPException(status_code=500, detail='AI 内容已生成，但保存商品化记录失败')
+
+    if material.get('id'):
+        try:
+            material_remark = json.loads(str(material.get('remark') or '{}'))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            material_remark = {}
+        material_remark['content_product_id'] = int(product_id)
+        db_manager.update_product_material(
+            int(material['id']), current_user['user_id'],
+            {'remark': json.dumps(material_remark, ensure_ascii=False)},
+        )
+
+    try:
+        package_base = Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'content_products' / str(current_user['user_id'])
+        package_paths = write_product_package(
+            package_base, str(product_id),
+            source, listing, rights_status=rights_status, output_mode=output_mode,
+        )
+        db_manager.update_content_product(product_id, current_user['user_id'], {
+            'package_dir': package_paths.get('directory'),
+            'package_zip': package_paths.get('zip'),
+            'status': status_value,
+        })
+        delivery_assets = _upsert_content_delivery_assets(
+            user_id=current_user['user_id'], product_id=int(product_id), title=listing['title'],
+            delivery_text=str(request.delivery_text or ''),
+            existing_metadata={'delivery': {}},
+        )
+        if delivery_assets:
+            latest_metadata = (db_manager.get_content_product(product_id, current_user['user_id']) or {}).get('metadata') or {}
+            latest_metadata['delivery'] = delivery_assets
+            db_manager.update_content_product(product_id, current_user['user_id'], {'metadata': latest_metadata})
+    except Exception as exc:
+        logger.exception('写入内容商品化包失败')
+        db_manager.update_content_product(product_id, current_user['user_id'], {
+            'status': 'failed', 'error_message': str(exc)[:1000],
+        })
+        raise HTTPException(status_code=500, detail=f'内容包写入失败：{exc}') from exc
+
+    publish_result = None
+    if request.publish_after_review and rights_status != 'reference_only':
+        account_id = str(request.account_id or '').strip()
+        if not account_id:
+            raise HTTPException(status_code=400, detail='一键上架需要先选择闲鱼账号')
+        publish_result = await _publish_product_to_account(
+            current_user=current_user,
+            account_id=account_id,
+            title=listing['title'],
+            description=listing['description'],
+            images=material.get('images') or [],
+            current_price=listing.get('suggested_price'),
+            original_price=listing.get('original_price'),
+            delivery_choice=request.delivery_method or '无需邮寄',
+            post_price=0,
+            can_self_pickup=False,
+            category_hint=listing.get('category'),
+            material_id=material.get('id'),
+        )
+        db_manager.update_content_product(product_id, current_user['user_id'], {'status': 'published'})
+
+    product = db_manager.get_content_product(product_id, current_user['user_id'])
+    response = _content_product_public_view(product, current_user['user_id']) or {}
+    response['publish_result'] = publish_result
+    response['warnings'] = list(generated.get('warnings') or [])
+    if fetch_warning:
+        response['warnings'].append(fetch_warning)
+    if not str(request.delivery_text or '').strip():
+        response['warnings'].append('未配置自动发货文字/链接；可在“自动发货”中手动创建，或下次生成时填写')
+    return {
+        'success': True,
+        'message': '内容已生成：商品素材可继续编辑，Markdown/Skill 包已保存',
+        'product': response,
+    }
+
+
+@app.get('/content-products')
+def list_content_products(
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    data = db_manager.list_content_products(current_user['user_id'], page=page, page_size=page_size)
+    data['items'] = [_content_product_public_view(item, current_user['user_id']) for item in data.get('items') or []]
+    return {'success': True, **data}
+
+
+@app.get('/content-products/{product_id}')
+def get_content_product(product_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    product = db_manager.get_content_product(product_id, current_user['user_id'])
+    if not product:
+        raise HTTPException(status_code=404, detail='内容商品不存在')
+    return {'success': True, 'product': _content_product_public_view(product, current_user['user_id'])}
+
+
+@app.put('/content-products/{product_id}')
+def update_content_product(
+    product_id: int,
+    request: ContentProductUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    product = db_manager.get_content_product(product_id, current_user['user_id'])
+    if not product:
+        raise HTTPException(status_code=404, detail='内容商品不存在')
+    updates = request.model_dump(exclude_unset=True)
+    if 'title' in updates and not str(updates['title'] or '').strip():
+        raise HTTPException(status_code=400, detail='商品标题不能为空')
+    if 'description' in updates and not str(updates['description'] or '').strip():
+        raise HTTPException(status_code=400, detail='商品介绍不能为空')
+    if 'rights_status' in updates and updates['rights_status'] not in {'self_owned', 'licensed', 'public_domain', 'reference_only'}:
+        raise HTTPException(status_code=400, detail='来源状态不受支持')
+    delivery_text = str(updates.pop('delivery_text', '') or '').strip()
+    if updates and not db_manager.update_content_product(product_id, current_user['user_id'], updates):
+        raise HTTPException(status_code=500, detail='更新内容商品失败')
+    if not updates and not delivery_text:
+        raise HTTPException(status_code=400, detail='请至少填写一项要更新的内容')
+    material_id = product.get('material_id')
+    if material_id:
+        db_manager.update_product_material(material_id, current_user['user_id'], {
+            key: value for key, value in updates.items() if key in {'title', 'description', 'category', 'price', 'original_price'}
+        })
+    latest = db_manager.get_content_product(product_id, current_user['user_id'])
+    if delivery_text:
+        delivery_assets = _upsert_content_delivery_assets(
+            user_id=current_user['user_id'], product_id=int(product_id),
+            title=str(latest.get('title') or ''), delivery_text=delivery_text,
+            existing_metadata=latest.get('metadata') or {},
+        )
+        metadata = dict(latest.get('metadata') or {})
+        metadata['delivery'] = delivery_assets
+        db_manager.update_content_product(product_id, current_user['user_id'], {'metadata': metadata})
+        latest = db_manager.get_content_product(product_id, current_user['user_id'])
+    # Rebuild local Markdown/Skill exports after edits, keeping the source snapshot.
+    try:
+        package_dir = Path(str(latest.get('package_dir') or ''))
+        source_text_path = package_dir / 'source.txt'
+        if package_dir.is_dir() and source_text_path.is_file():
+            source = ContentSource(
+                url=str(latest.get('source_url') or ''),
+                title=str(latest.get('source_title') or ''),
+                text=source_text_path.read_text(encoding='utf-8'),
+                excerpt=str(latest.get('source_excerpt') or ''),
+                fetched=True,
+            )
+            write_product_package(
+                package_dir.parent, str(product_id), source,
+                {'title': latest.get('title'), 'description': latest.get('description'), 'category': latest.get('category')},
+                rights_status=latest.get('rights_status') or 'reference_only',
+                output_mode=latest.get('output_mode') or 'bundle',
+            )
+    except Exception as exc:
+        logger.warning(f'更新后重建内容包失败: {exc}')
+    return {'success': True, 'message': '内容商品已更新', 'product': _content_product_public_view(db_manager.get_content_product(product_id, current_user['user_id']), current_user['user_id'])}
+
+
+@app.delete('/content-products/{product_id}')
+def delete_content_product(product_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    product = db_manager.get_content_product(product_id, current_user['user_id'])
+    if not product:
+        raise HTTPException(status_code=404, detail='内容商品不存在')
+    if not db_manager.delete_content_product(product_id, current_user['user_id']):
+        raise HTTPException(status_code=500, detail='删除内容商品失败')
+    for candidate in (product.get('package_dir'), product.get('package_zip')):
+        if candidate:
+            path = Path(str(candidate))
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.is_file():
+                    path.unlink()
+            except OSError as exc:
+                logger.warning(f'清理内容包文件失败: {path}: {exc}')
+    return {'success': True, 'message': '内容商品已删除'}
+
+
+@app.get('/content-products/{product_id}/download')
+def download_content_product(product_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    product = db_manager.get_content_product(product_id, current_user['user_id'])
+    if not product:
+        raise HTTPException(status_code=404, detail='内容商品不存在')
+    package_zip = Path(str(product.get('package_zip') or ''))
+    if not package_zip.is_file():
+        raise HTTPException(status_code=404, detail='内容包文件不存在，请重新生成')
+    return FileResponse(str(package_zip), filename=f"content-product-{product_id}.zip", media_type='application/zip')
 
 
 @app.get("/product-materials")
@@ -13309,6 +15026,7 @@ TASK_LOG_TYPE_LABELS = {
     'auto_comment': '自动评价',
     'auto_red_flower': '求小红花',
     'item_polish': '商品擦亮',
+    'quark_catalog_sync': '夸克目录上架',
     'login_renew': '登录续期',
     'cookie_refresh': 'Cookie刷新',
     'other_task': '其他任务',
@@ -14696,7 +16414,11 @@ async def retry_order_platform_confirm(order_id: str, current_user: Dict[str, An
 
 
 @app.post('/api/orders/{order_id}/deliver')
-async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def manual_deliver_order(
+    order_id: str,
+    resend: bool = False,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """手动发货 - 根据订单信息匹配发货规则并发送卡券"""
     try:
         from db_manager import db_manager
@@ -14728,11 +16450,40 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         item_id = order.get('item_id')
         buyer_id = order.get('buyer_id')
 
+        if not item_id or not buyer_id:
+            # 历史订单列表可能只落了订单号和金额。手动发货时再从卖家订单
+            # 详情接口补齐 itemId/peerUserId，避免用户只能先点“按订单ID补抓”。
+            try:
+                await xianyu_instance.fetch_order_detail_info(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    sid=order.get('sid'),
+                    buyer_nick=order.get('buyer_nick'),
+                    buyer_id_source='manual_delivery_identity_recovery',
+                    force_refresh=True,
+                )
+                order = db_manager.get_order_by_id(order_id) or order
+                item_id = order.get('item_id')
+                buyer_id = order.get('buyer_id')
+                log_with_user(
+                    'info',
+                    f"手动发货前已尝试补齐订单身份: order_id={order_id}, "
+                    f"item_id={item_id or '-'}, buyer_id={buyer_id or '-'}",
+                    current_user,
+                )
+            except Exception as detail_error:
+                log_with_user(
+                    'warning',
+                    f"手动发货前补齐订单身份失败: order_id={order_id}, error={detail_error}",
+                    current_user,
+                )
+
         if not item_id:
-            return {"success": False, "delivered": False, "message": "订单缺少商品信息"}
+            return {"success": False, "delivered": False, "message": "订单缺少商品信息，已尝试从订单详情补抓仍未获取到商品ID"}
 
         if not buyer_id:
-            return {"success": False, "delivered": False, "message": "订单缺少买家信息，无法发送消息"}
+            return {"success": False, "delivered": False, "message": "订单缺少买家信息，已尝试从订单详情补抓仍未获取到买家ID"}
 
         blacklist_hit = blacklist_service.is_buyer_blacklisted(
             user_id=user_id,
@@ -14832,8 +16583,19 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         if not remaining_unit_indexes:
             aggregate_status = progress_after_finalize.get('aggregate_status')
             if aggregate_status == 'shipped':
-                return {"success": True, "delivered": True, "message": "订单所有发货单元都已完成，本次仅补完成未收尾记录"}
-            return {"success": True, "delivered": True, "message": "订单当前没有可补发的未完成单元"}
+                if not resend:
+                    return {"success": True, "delivered": True, "message": "订单所有发货单元都已完成，本次仅补完成未收尾记录"}
+                # 订单已经被平台标记为已发货但买家未收到聊天内容时，允许用户
+                # 通过明确的“补发卡券”操作重新匹配并发送一次。这里不把 buyer_id
+                # 当作 cid，后续仍会根据 sid 或 create_chat 建立真实会话。
+                remaining_unit_indexes = list(range(1, expected_quantity + 1))
+                log_with_user(
+                    'warning',
+                    f"手动补发卡券: 订单已完成，重新发送 {len(remaining_unit_indexes)} 个发货单元, order_id={order_id}",
+                    current_user,
+                )
+            else:
+                return {"success": True, "delivered": True, "message": "订单当前没有可补发的未完成单元"}
 
         unit_results = []
         prepared_units = []
@@ -14968,16 +16730,29 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
 
         ws = getattr(xianyu_instance, 'ws', None)
-        manual_chat_id = buyer_id
-        if ws:
-            sid = order.get('sid', '')
-            if sid:
-                manual_chat_id = sid.replace('@goofish', '')
-                log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={manual_chat_id}, buyer_id={buyer_id}", current_user)
-            else:
-                log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid, buyer_id={buyer_id}", current_user)
+        # sid 才是闲鱼 IM 会话 cid，buyer_id 只是用户 ID，不能直接拼成 cid。
+        # 历史订单可能没有 sid；这种情况下即使主 WebSocket 已连接，也必须走
+        # create_chat -> singleChatConversation 回包流程，让平台返回真实会话 ID。
+        sid = str(order.get('sid') or '').strip()
+        manual_chat_id = sid.replace('@goofish', '').strip() if sid else ''
+        if ws and manual_chat_id:
+            log_with_user(
+                'info',
+                f"手动发货: 使用订单 sid 发送, cid={manual_chat_id}, buyer_id={buyer_id}",
+                current_user,
+            )
+        elif ws:
+            log_with_user(
+                'warning',
+                f"手动发货: 订单缺少 sid，不把 buyer_id 当作 cid；改用独立连接创建会话, buyer_id={buyer_id}",
+                current_user,
+            )
         else:
-            log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_delivery_steps_once, buyer_id={buyer_id}", current_user)
+            log_with_user(
+                'warning',
+                f"手动发货: 无现有WebSocket连接，使用独立连接创建会话, buyer_id={buyer_id}",
+                current_user,
+            )
 
         send_groups = xianyu_instance._build_delivery_send_groups(prepared_units, expected_quantity)
         total_send_groups = len(send_groups)
@@ -14992,7 +16767,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             is_batched_text_group = send_group.get('mode') == 'batched_text'
 
             try:
-                if ws:
+                if ws and manual_chat_id:
                     await xianyu_instance._send_delivery_steps(
                         ws,
                         manual_chat_id,
@@ -15005,6 +16780,9 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                         )
                     )
                 else:
+                    # 没有可靠 sid 时，send_delivery_steps_once 会先创建会话，
+                    # 从平台回包中取得真实 cid，再发送卡券，避免发到
+                    # buyer_id@goofish 这种不存在的会话。
                     await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, send_group.get('delivery_steps') or [])
             except Exception as send_error:
                 send_error_text = str(send_error)
@@ -15182,7 +16960,10 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             message_parts.append(f"仍有 {len(failed_now)} 个单元补发失败")
 
         aggregate_status = progress_summary_after.get('aggregate_status')
-        if aggregate_status == 'shipped':
+        # “补发卡券”是一次独立投递操作。即使订单此前已经处于已发货，
+        # 本次消息未获平台确认也必须明确返回失败，不能被历史的 shipped
+        # 状态掩盖成一次成功补发。
+        if aggregate_status == 'shipped' and not (resend and failed_now):
             message_parts.append(f"订单已全部完成（{progress_summary_after.get('finalized_count', 0)}/{expected_quantity}）")
         elif aggregate_status == 'partial_pending_finalize':
             message_parts.append(
@@ -15197,7 +16978,11 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         if not message_parts:
             message_parts.append("订单当前没有可推进的发货单元")
 
-        return {"success": True, "delivered": delivered, "message": '，'.join(message_parts)}
+        return {
+            "success": not bool(failed_now),
+            "delivered": delivered,
+            "message": '，'.join(message_parts),
+        }
 
     except Exception as e:
         log_with_user('error', f"手动发货异常: 订单 {order_id} - {str(e)}", current_user)
@@ -15999,6 +17784,31 @@ async def scheduled_task_checker():
                                 xianyu_instance = XianyuLive(cookies_str, account_id, register_instance=False)
                                 result = await xianyu_instance.polish_all_items()
                                 await xianyu_instance.close_session()
+                    elif task_type == 'quark_catalog_sync':
+                        user_info = db_manager.get_user_by_id(task.get('user_id'))
+                        if not user_info:
+                            result = {'success': False, 'message': '任务所属用户不存在'}
+                        else:
+                            catalog_user = {
+                                'user_id': user_info['id'],
+                                'username': user_info['username'],
+                                'is_admin': bool(user_info.get('is_admin')),
+                            }
+                            catalog_settings = db_manager.get_quark_catalog_settings(
+                                user_info['id'], include_secrets=True
+                            )
+                            try:
+                                result = await _execute_quark_catalog_sync(
+                                    catalog_user,
+                                    catalog_settings,
+                                    QuarkCatalogSyncRequest(publish=None, force=False),
+                                )
+                            except Exception as sync_error:
+                                detail = sync_error.detail if isinstance(sync_error, HTTPException) else str(sync_error)
+                                result = {
+                                    'success': False, 'failed': 1, 'total': 0,
+                                    'message': f"夸克目录定时同步失败：{mask_sensitive_text(detail)}",
+                                }
                     else:
                         result = {"success": False, "message": f"未知任务类型: {task_type}"}
 
@@ -16013,10 +17823,15 @@ async def scheduled_task_checker():
                     db_manager.update_task_run_result(task_id, result, next_run_str)
                     try:
                         total = int(result.get('total') or 0) if isinstance(result, dict) else 0
-                        polished = int(result.get('polished') or 0) if isinstance(result, dict) else 0
                         failed = int(result.get('failed') or 0) if isinstance(result, dict) else 0
-                        status = 'success' if result.get('success') and failed == 0 else ('partial_success' if result.get('success') and polished > 0 else 'failed')
-                        message = result.get('message') or f"定时任务执行完成：总计 {total}，成功 {polished}，失败 {failed}"
+                        succeeded = int(
+                            result.get('polished') or result.get('published') or result.get('ready') or 0
+                        ) if isinstance(result, dict) else 0
+                        status = (
+                            'success' if result.get('success') and failed == 0
+                            else ('partial_success' if succeeded > 0 else 'failed')
+                        )
+                        message = result.get('message') or f"定时任务执行完成：总计 {total}，成功 {succeeded}，失败 {failed}"
                         db_manager.add_scheduled_task_log(
                             batch_id=f"scheduled_task_{task_id}_{uuid.uuid4()}",
                             task_type=task_type if task_type in TASK_LOG_TYPE_LABELS else 'other_task',

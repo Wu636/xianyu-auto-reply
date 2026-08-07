@@ -4956,6 +4956,34 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】{source} 发现订单待发货，但自动发货未启用: {order_id}")
             return False
         if not item_id or not buyer_id:
+            # 历史订单列表接口可能只返回订单号/金额，先用卖家订单详情接口补齐
+            # itemId 和 peerUserId，再进入发货流程；否则订单会永久卡在待发货。
+            try:
+                await self.fetch_order_detail_info(
+                    order_id=order_id,
+                    item_id=item_id or None,
+                    buyer_id=buyer_id or None,
+                    sid=sid or None,
+                    buyer_nick=order.get('buyer_nick') or fallback_order.get('buyer_nick'),
+                    buyer_id_source=f'{source}_identity_recovery',
+                    force_refresh=True,
+                )
+                refreshed_order = db_manager.get_order_by_id(order_id) or {}
+                item_id = str(refreshed_order.get('item_id') or item_id or '').strip()
+                buyer_id = str(refreshed_order.get('buyer_id') or buyer_id or '').strip()
+                sid = str(refreshed_order.get('sid') or sid or '').strip()
+                order = {**order, **refreshed_order}
+                logger.info(
+                    f"【{self.cookie_id}】{source} 已尝试从订单详情补齐身份: "
+                    f"order_id={order_id}, item_id={item_id or '-'}, buyer_id={buyer_id or '-'}"
+                )
+            except Exception as detail_error:
+                logger.warning(
+                    f"【{self.cookie_id}】{source} 补齐订单身份失败: "
+                    f"order_id={order_id}, error={self._safe_str(detail_error)}"
+                )
+
+        if not item_id or not buyer_id:
             logger.warning(
                 f"【{self.cookie_id}】{source} 发现订单待发货，但缺少商品或买家信息，无法补偿发货: "
                 f"order_id={order_id}, item_id={item_id or '-'}, buyer_id={buyer_id or '-'}"
@@ -9000,7 +9028,9 @@ class XianyuLive:
         try:
             logger.info(f"【{self.cookie_id}】测试图片上传API（使用测试图片实际上传）...")
             
-            # 创建一个最小的测试图片（1x1像素的PNG）
+            # 创建一个符合闲鱼CDN最低像素要求的测试图片。
+            # 1x1 图片会被接口以 FILE_PIXEL_TOO_LOW 拒绝，不能据此判断
+            # Cookie 或账号风控状态。
             import tempfile
             import os
             from PIL import Image
@@ -9010,8 +9040,8 @@ class XianyuLive:
             test_image_path = os.path.join(temp_dir, f'cookie_test_{self.cookie_id}.png')
             
             try:
-                # 创建1x1像素的白色图片
-                img = Image.new('RGB', (1, 1), color='white')
+                # 使用 120x120，足够小且不会触发最低像素校验
+                img = Image.new('RGB', (120, 120), color='white')
                 img.save(test_image_path, 'PNG')
                 logger.info(f"【{self.cookie_id}】已创建测试图片: {test_image_path}")
                 
@@ -11423,6 +11453,27 @@ class XianyuLive:
                         text = str(value).strip()
                         return text if text else None
 
+                    def _normalize_identity_text(value):
+                        """过滤订单接口返回的空占位，避免把 '-' 写成真实身份。"""
+                        text = _normalize_optional_text(value)
+                        if not text or text.lower() in {'none', 'null', 'unknown', 'undefined', '-', '--'}:
+                            return None
+                        return text
+
+                    # 卖家订单详情接口的结构化响应包含 item_id/buyer_id；当历史订单列表
+                    # 没有权限时，补抓详情仍可用这些字段恢复完整订单，继续自动/手动发货。
+                    detail_item_id = _normalize_identity_text(result.get('item_id'))
+                    detail_buyer_id = _normalize_identity_text(result.get('buyer_id'))
+                    detail_buyer_nick = _normalize_identity_text(result.get('buyer_nick'))
+                    item_id = _normalize_identity_text(item_id) or detail_item_id
+                    buyer_id = _normalize_identity_text(buyer_id) or detail_buyer_id
+                    buyer_nick = _normalize_identity_text(buyer_nick) or detail_buyer_nick
+                    sid = _normalize_identity_text(sid)
+                    logger.info(
+                        f"【{self.cookie_id}】订单身份解析: order_id={order_id}, "
+                        f"item_id={item_id or '-'}, buyer_id={buyer_id or '-'}, buyer_nick={buyer_nick or '-'}"
+                    )
+
                     def _normalize_amount_text(value):
                         text = _normalize_optional_text(value)
                         if not text:
@@ -11804,8 +11855,29 @@ class XianyuLive:
                             logger.warning(f"数据库中商品标题和详情都为空: {item_id}")
                             search_text = item_title or item_id
                     else:
-                        logger.warning(f"数据库中未找到商品信息: {item_id}")
-                        search_text = item_title or item_id
+                        # 商品刚发布后，平台商品列表接口可能因限流/风控暂时
+                        # 同步失败，item_info 尚未建立。发布日志仍保存了原始
+                        # 标题和描述，优先用它们继续匹配自动发货规则。
+                        publish_log = db_manager.get_publish_log_by_item_id(
+                            item_id,
+                            account_id=self.cookie_id,
+                            user_id=self.user_id,
+                        )
+                        if publish_log:
+                            publish_title = str(publish_log.get('title') or '').strip()
+                            publish_description = str(publish_log.get('description') or '').strip()
+                            search_parts = [part for part in (publish_title, publish_description) if part]
+                            if search_parts:
+                                search_text = ' '.join(search_parts)
+                                logger.warning(
+                                    f"数据库商品列表尚未同步，已使用发布记录兜底匹配: "
+                                    f"item_id={item_id}, title='{publish_title}'"
+                                )
+                            else:
+                                search_text = item_title or item_id
+                        else:
+                            logger.warning(f"数据库中未找到商品信息或发布记录: {item_id}")
+                            search_text = item_title or item_id
 
                 except Exception as db_e:
                     logger.warning(f"从数据库获取商品信息失败: {self._safe_str(db_e)}")
@@ -12448,6 +12520,7 @@ class XianyuLive:
 
         total_steps = len(steps)
         user_url = user_url or f'https://www.goofish.com/personal?userId={user_id}'
+        send_receipts = []
 
         for index, step in enumerate(steps, start=1):
             step_type = step.get('type')
@@ -12465,18 +12538,22 @@ class XianyuLive:
                         logger.error(f"无效的卡券ID: {card_id_str}")
                         image_card_id = card_id
 
-                await self.send_image_msg(websocket, chat_id, user_id, image_url, card_id=image_card_id)
+                send_receipts.append(
+                    await self.send_image_msg(websocket, chat_id, user_id, image_url, card_id=image_card_id)
+                )
                 logger.info(
                     f"【{log_prefix}】步骤 {index}/{total_steps} 已向 {user_url} 发送图片: {image_url}"
                 )
             else:
-                await self.send_msg(websocket, chat_id, user_id, step_content)
+                send_receipts.append(await self.send_msg(websocket, chat_id, user_id, step_content))
                 logger.info(
                     f"【{log_prefix}】步骤 {index}/{total_steps} 已向 {user_url} 发送文本内容"
                 )
 
             if total_steps > 1 and index < total_steps:
                 await asyncio.sleep(0.3)
+
+        return send_receipts
 
     async def _get_api_card_content(self, rule, order_id=None, item_id=None, buyer_id=None, spec_name=None, spec_value=None, retry_count=0):
         """调用API获取卡券内容，支持动态参数替换和重试机制"""
@@ -13109,7 +13186,33 @@ class XianyuLive:
         }
         await ws.send(json.dumps(msg))
 
+    @staticmethod
+    def _validate_message_send_response(response):
+        """校验 MessageSend 的平台回执，拒绝把“已写入 WebSocket”当作发送成功。"""
+        if not isinstance(response, dict):
+            raise RuntimeError("闲鱼消息发送未返回有效回执")
+
+        response_code = response.get("code")
+        if response_code not in (None, 0, "0", 200, "200"):
+            reason = response.get("reason") or response.get("message") or response.get("developerMessage") or "未知错误"
+            raise RuntimeError(f"闲鱼消息发送被拒绝(code={response_code}): {reason}")
+
+        body = response.get("body")
+        if isinstance(body, dict):
+            body_code = body.get("code")
+            if body_code not in (None, 0, "0", 200, "200", "SUCCESS", "success"):
+                reason = body.get("reason") or body.get("message") or body.get("developerMessage") or "未知错误"
+                raise RuntimeError(f"闲鱼消息发送被拒绝(code={body_code}): {reason}")
+            if body.get("success") is False:
+                reason = body.get("reason") or body.get("message") or "未知错误"
+                raise RuntimeError(f"闲鱼消息发送失败: {reason}")
+
     async def send_msg(self, ws, cid, toid, text):
+        """发送文本消息。
+
+        主 WebSocket 由监听循环负责接收回包，因此这里注册 waiter 并等待
+        MessageSend 的明确成功响应；临时连接则把 mid 交给调用方继续等待。
+        """
         text = {
             "contentType": 1,
             "text": {
@@ -13117,43 +13220,60 @@ class XianyuLive:
             }
         }
         text_base64 = str(base64.b64encode(json.dumps(text).encode('utf-8')), 'utf-8')
+        mid = generate_mid()
+        body = [
+            {
+                "uuid": generate_uuid(),
+                "cid": f"{cid}@goofish",
+                "conversationType": 1,
+                "content": {
+                    "contentType": 101,
+                    "custom": {
+                        "type": 1,
+                        "data": text_base64
+                    }
+                },
+                "redPointPolicy": 0,
+                "extension": {
+                    "extJson": "{}"
+                },
+                "ctx": {
+                    "appVersion": "1.0",
+                    "platform": "web"
+                },
+                "mtags": {},
+                "msgReadStatusSetting": 1
+            },
+            {
+                "actualReceivers": [
+                    f"{toid}@goofish",
+                    f"{self.myid}@goofish"
+                ]
+            }
+        ]
+
+        # 主连接有专门的监听循环可将同 mid 的回包分发给 waiter。
+        # 此处必须等到平台确认，避免“订单已发货但卡密未发出”的假成功。
+        if ws is getattr(self, 'ws', None):
+            response = await self._request_lwp_response_on_current_ws(
+                "/r/MessageSend/sendByReceiverScope",
+                body,
+                timeout=12,
+                mid=mid,
+            )
+            self._validate_message_send_response(response)
+            logger.info(f"【{self.cookie_id}】闲鱼文本消息已收到平台回执: mid={mid}")
+            return {"mid": mid, "confirmed": True, "response": response}
+
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
-                "mid": generate_mid()
+                "mid": mid
             },
-            "body": [
-                {
-                    "uuid": generate_uuid(),
-                    "cid": f"{cid}@goofish",
-                    "conversationType": 1,
-                    "content": {
-                        "contentType": 101,
-                        "custom": {
-                            "type": 1,
-                            "data": text_base64
-                        }
-                    },
-                    "redPointPolicy": 0,
-                    "extension": {
-                        "extJson": "{}"
-                    },
-                    "ctx": {
-                        "appVersion": "1.0",
-                        "platform": "web"
-                    },
-                    "mtags": {},
-                    "msgReadStatusSetting": 1
-                },
-                {
-                    "actualReceivers": [
-                        f"{toid}@goofish",
-                        f"{self.myid}@goofish"
-                    ]
-                }
-            ]
+            "body": body
         }
         await ws.send(json.dumps(msg))
+        return {"mid": mid, "confirmed": False}
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -13255,12 +13375,13 @@ class XianyuLive:
             logger.debug(f"【{self.cookie_id}】分发LWP响应失败: {self._safe_str(e)}")
             return False
 
-    async def _request_lwp_on_current_ws(self, lwp: str, body: list, timeout: int = 10):
+    async def _request_lwp_response_on_current_ws(self, lwp: str, body: list, timeout: int = 10, mid: str = None):
+        """经由主连接发送 LWP 请求并返回完整平台回包。"""
         ws = self.ws
         if not ws or getattr(ws, 'closed', False):
             return {"code": "not_connected", "reason": "账号WebSocket未连接"}
 
-        mid = generate_mid()
+        mid = str(mid or generate_mid())
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self.lwp_response_waiters[mid] = future
@@ -13271,7 +13392,7 @@ class XianyuLive:
                 "body": body,
             }))
             response = await asyncio.wait_for(future, timeout=max(1, int(timeout or 10)))
-            return response.get("body", {}) if isinstance(response, dict) else {}
+            return response if isinstance(response, dict) else {"code": "invalid_response", "reason": "IM返回格式异常"}
         except asyncio.TimeoutError:
             return {"code": "timeout", "reason": "IM请求超时"}
         except Exception as e:
@@ -13280,6 +13401,25 @@ class XianyuLive:
             current = self.lwp_response_waiters.pop(mid, None)
             if current and not current.done():
                 current.cancel()
+
+    async def _request_lwp_on_current_ws(self, lwp: str, body: list, timeout: int = 10):
+        """兼容旧调用：仅返回 LWP 回包 body。"""
+        response = await self._request_lwp_response_on_current_ws(lwp, body, timeout=timeout)
+        if not isinstance(response, dict):
+            return {}
+        response_code = response.get("code")
+        result_body = response.get("body")
+        if isinstance(result_body, dict):
+            # 保留旧接口以 body 判断错误的行为，同时带上根级 code。
+            if response_code not in (None, 0, "0", 200, "200") and "code" not in result_body:
+                result_body = dict(result_body)
+                result_body["code"] = response_code
+                result_body.setdefault("reason", response.get("reason") or response.get("message"))
+            return result_body
+        return {
+            "code": response_code if response_code is not None else "invalid_response",
+            "reason": response.get("reason") or response.get("message") or "IM返回格式异常",
+        }
 
     async def list_all_conversations(self, cid: str, page_size: int = 20):
         """拉取指定会话的历史消息。"""
@@ -15217,16 +15357,52 @@ class XianyuLive:
 
                     logger.info(f"【{self.cookie_id}】message: {message}")
                     message = json.loads(message)
+                    await self._ack_lwp_message(websocket, message)
                     cid = message["body"]["singleChatConversation"]["cid"]
                     cid = cid.split('@')[0]
-                    await self._send_delivery_steps(
+                    send_receipts = await self._send_delivery_steps(
                         websocket,
                         cid,
                         toid,
                         delivery_steps,
                         log_prefix="单次手动发货"
                     )
-                    logger.info(f'【{self.cookie_id}】send delivery steps success')
+                    pending_mids = {
+                        str(receipt.get('mid'))
+                        for receipt in (send_receipts or [])
+                        if isinstance(receipt, dict) and receipt.get('mid') and not receipt.get('confirmed')
+                    }
+
+                    # 独立连接没有主监听循环；必须在当前连接继续等 MessageSend
+                    # 的回执。之前这里立即返回 True，导致未被平台接收的消息也会
+                    # 被标记为“已发货”。
+                    if pending_mids:
+                        receipt_deadline = time.time() + 12
+                        while pending_mids:
+                            remaining = receipt_deadline - time.time()
+                            if remaining <= 0:
+                                raise RuntimeError(
+                                    "闲鱼消息发送未收到平台回执: " + ", ".join(sorted(pending_mids))
+                                )
+                            raw_receipt = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                            try:
+                                receipt_message = json.loads(raw_receipt)
+                            except Exception:
+                                continue
+                            await self._ack_lwp_message(websocket, receipt_message)
+                            receipt_mid = str((receipt_message.get('headers') or {}).get('mid') or '')
+                            if receipt_mid not in pending_mids:
+                                logger.debug(
+                                    f"【{self.cookie_id}】等待发货回执时收到其他消息: mid={receipt_mid or '-'}"
+                                )
+                                continue
+                            self._validate_message_send_response(receipt_message)
+                            pending_mids.remove(receipt_mid)
+                            logger.info(
+                                f"【{self.cookie_id}】发货文本已收到闲鱼平台回执: mid={receipt_mid}"
+                            )
+
+                    logger.info(f'【{self.cookie_id}】send delivery steps platform-confirmed')
                     return True
                 except KeyError:
                     continue
@@ -17779,6 +17955,14 @@ class XianyuLive:
             logger.error("获取商品信息失败，重试次数过多")
             return {"error": "获取商品信息失败，重试次数过多"}
 
+        # 闲鱼商品列表接口对单页数量有服务端上限。项目部分旧调用会传入
+        # 100，接口会直接返回“最大可查看页数或者每页最大可查看商品数超限”。
+        # 统一限制在已验证可用的 20 条，避免把参数错误误判为账号被限流。
+        try:
+            page_size = max(1, min(int(page_size), 20))
+        except (TypeError, ValueError):
+            page_size = 20
+
         # 确保session已创建
         if not self.session:
             await self.create_session()
@@ -18093,12 +18277,8 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】Base64编码长度: {len(content_base64)}")
 
             # 构造WebSocket消息（完全参考send_msg的格式）
-            msg = {
-                "lwp": "/r/MessageSend/sendByReceiverScope",
-                "headers": {
-                    "mid": generate_mid()
-                },
-                "body": [
+            mid = generate_mid()
+            body = [
                     {
                         "uuid": generate_uuid(),
                         "cid": f"{cid}@goofish",
@@ -18128,10 +18308,27 @@ class XianyuLive:
                         ]
                     }
                 ]
+
+            if ws is getattr(self, 'ws', None):
+                response = await self._request_lwp_response_on_current_ws(
+                    "/r/MessageSend/sendByReceiverScope",
+                    body,
+                    timeout=12,
+                    mid=mid,
+                )
+                self._validate_message_send_response(response)
+                logger.info(f"【{self.cookie_id}】闲鱼图片消息已收到平台回执: mid={mid}")
+                return {"mid": mid, "confirmed": True, "response": response}
+
+            msg = {
+                "lwp": "/r/MessageSend/sendByReceiverScope",
+                "headers": {"mid": mid},
+                "body": body,
             }
 
             await ws.send(json.dumps(msg))
             logger.info(f"【{self.cookie_id}】图片消息发送成功: {image_url}")
+            return {"mid": mid, "confirmed": False}
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送图片消息失败: {self._safe_str(e)}")

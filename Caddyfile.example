@@ -1,0 +1,5 @@
+# 将 example.your-domain.com 替换为你的域名，并把 DNS A/AAAA 记录指向服务器。
+# Caddy 会自动申请和续期 HTTPS 证书。
+example.your-domain.com {
+    reverse_proxy 127.0.0.1:8090
+}

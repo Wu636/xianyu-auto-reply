@@ -92,6 +92,9 @@ class OrderDetailFetcher:
         self._active_order_id = ''
         self._captured_amount_candidates: List[Dict[str, Any]] = []
         self._captured_sku_candidates: List[Dict[str, Any]] = []
+        # 卖家订单详情接口会在结构化响应中返回 itemId/peerUserId，但旧逻辑只解析金额、规格和状态，
+        # 导致“按订单号补抓”后订单仍缺少商品/买家信息，无法继续发货。
+        self._captured_order_identity: Dict[str, str] = {}
         self._pending_response_tasks = set()
         self._response_handler = None
 
@@ -457,6 +460,15 @@ class OrderDetailFetcher:
 
                     order_time_fields = await self._get_order_time_fields()
 
+                    # 响应监听任务通常已在 SKU 解析阶段等待过；这里再等一次，确保
+                    # 身份字段不会因为响应稍晚到达而丢失。
+                    await self._wait_for_response_capture_tasks(timeout=1.0)
+                    order_identity = dict(self._captured_order_identity or {})
+                    if not order_identity.get('buyer_nick'):
+                        page_buyer_nick = await self._get_buyer_nick_from_page()
+                        if page_buyer_nick:
+                            order_identity['buyer_nick'] = page_buyer_nick
+
                     result = {
                         'order_id': order_id,
                         'url': url,
@@ -475,6 +487,9 @@ class OrderDetailFetcher:
                         'platform_created_at': order_time_fields.get('platform_created_at'),
                         'platform_paid_at': order_time_fields.get('platform_paid_at'),
                         'platform_completed_at': order_time_fields.get('platform_completed_at'),
+                        'item_id': order_identity.get('item_id'),
+                        'buyer_id': order_identity.get('buyer_id'),
+                        'buyer_nick': order_identity.get('buyer_nick'),
                         'timestamp': time.time(),
                         'from_cache': False  # 标记数据来源
                     }
@@ -621,6 +636,7 @@ class OrderDetailFetcher:
         self._active_order_id = str(order_id or '').strip()
         self._captured_amount_candidates = []
         self._captured_sku_candidates = []
+        self._captured_order_identity = {}
         self._pending_response_tasks = set()
 
     def _clear_response_capture_handler(self) -> None:
@@ -730,6 +746,64 @@ class OrderDetailFetcher:
             return True
 
         return self._is_trusted_order_detail_response_url(lowered_url)
+
+    @staticmethod
+    def _normalize_identity_value(value: Any) -> Optional[str]:
+        """将订单身份字段标准化，并过滤接口常见的空占位值。"""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or text.lower() in {'none', 'null', 'unknown', 'undefined', '-', '--'}:
+            return None
+        return text
+
+    def _extract_order_identity_from_payload(self, payload: Any) -> Dict[str, str]:
+        """从订单详情结构化响应提取商品 ID、买家 ID 和买家昵称。
+
+        `mtop.idle.web.trade.order.detail` 的卖家视图当前在 data.itemId 和
+        data.peerUserId 提供这两个关键字段；不依赖页面 DOM，避免页面能显示但
+        解析器因样式变化拿不到身份信息。
+        """
+        if not isinstance(payload, dict):
+            return {}
+
+        data = payload.get('data')
+        if not isinstance(data, dict):
+            data = payload
+
+        result: Dict[str, str] = {}
+
+        def first_value(source: Dict[str, Any], keys: tuple) -> Optional[str]:
+            for key in keys:
+                value = self._normalize_identity_value(source.get(key))
+                if value:
+                    return value
+            return None
+
+        item_info = data.get('itemInfo') if isinstance(data.get('itemInfo'), dict) else {}
+        buyer_info = data.get('buyer') if isinstance(data.get('buyer'), dict) else {}
+
+        item_id = first_value(data, ('itemId', 'itemID', 'item_id')) or first_value(
+            item_info, ('itemId', 'itemID', 'item_id')
+        )
+        buyer_id = first_value(data, ('peerUserId', 'peerUserID', 'buyerId', 'buyerID', 'buyer_id')) or first_value(
+            buyer_info, ('userId', 'userID', 'buyerId', 'buyerID', 'id')
+        )
+        buyer_nick = first_value(
+            data,
+            ('buyerNick', 'buyerNickname', 'buyerName', 'buyer_nick')
+        ) or first_value(
+            buyer_info,
+            ('nick', 'nickname', 'nickName', 'buyerNick', 'buyerNickname', 'name')
+        )
+
+        if item_id:
+            result['item_id'] = item_id
+        if buyer_id:
+            result['buyer_id'] = buyer_id
+        if buyer_nick:
+            result['buyer_nick'] = buyer_nick
+        return result
 
     def _normalize_quantity_text(self, quantity_value: Any) -> Optional[str]:
         text = str(quantity_value or '').strip()
@@ -1214,6 +1288,14 @@ class OrderDetailFetcher:
 
             if payload is None or not self._payload_references_order(payload, order_id, url):
                 return
+
+            identity = self._extract_order_identity_from_payload(payload)
+            if identity:
+                self._captured_order_identity.update(identity)
+                logger.info(
+                    f"捕获订单身份: order_id={order_id}, "
+                    f"item_id={identity.get('item_id', '-')}, buyer_id={identity.get('buyer_id', '-')}"
+                )
 
             response_candidates = self._extract_amount_candidates_from_payload(payload, path=f"response[{url.split('?')[0]}]")
             for candidate in response_candidates:
@@ -1960,6 +2042,27 @@ class OrderDetailFetcher:
                 return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html_content)).strip()
             except Exception:
                 return ''
+
+    async def _get_buyer_nick_from_page(self) -> Optional[str]:
+        """从卖家订单详情页提取买家昵称，作为结构化响应的补充。"""
+        page_text = await self._get_page_text()
+        if not page_text:
+            return None
+
+        lines = [re.sub(r'\s+', ' ', line).strip() for line in page_text.splitlines()]
+        lines = [line for line in lines if line]
+        for index, line in enumerate(lines):
+            if not re.search(r'买家昵称|买家名称', line):
+                continue
+            inline = re.split(r'买家昵称|买家名称', line, maxsplit=1)[-1]
+            inline = re.sub(r'^\s*[:：]?\s*', '', inline).strip()
+            if inline and inline not in {'买家昵称', '买家名称'}:
+                return inline[:120]
+            if index + 1 < len(lines):
+                candidate = lines[index + 1].strip()
+                if candidate and not re.search(r'下单时间|付款时间|订单编号', candidate):
+                    return candidate[:120]
+        return None
 
     def _build_spec_candidate_identity(self, candidate: Dict[str, str]) -> Tuple[str, str, str, str]:
         """构建规格候选去重键，避免同一候选重复进入兜底流程。"""

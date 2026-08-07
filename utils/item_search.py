@@ -42,12 +42,14 @@ except ImportError:
 class XianyuSearcher:
     """闲鱼商品搜索器 - 基于 Playwright"""
 
-    def __init__(self):
+    def __init__(self, cookie_id: str = None, cookie_value: str = None):
         self.browser = None
         self.context = None
         self.page = None
         self.api_responses = []
-        self.user_id = "default"  # 默认用户ID
+        self.cookie_id = str(cookie_id or '').strip()
+        self.cookie_value = str(cookie_value or '').strip()
+        self.user_id = self.cookie_id or "default"
 
     async def _handle_scratch_captcha_manual(self, page, max_retries=3, wait_for_completion=True):
         """人工处理刮刮乐滑块（远程控制 + 截图备份）
@@ -634,6 +636,9 @@ class XianyuSearcher:
     async def get_first_valid_cookie(self):
         """获取第一个有效的cookie"""
         try:
+            if self.cookie_id and self.cookie_value:
+                return {'id': self.cookie_id, 'value': self.cookie_value}
+
             from db_manager import db_manager
 
             # 获取所有cookies，返回格式是 {id: value}
@@ -692,7 +697,11 @@ class XianyuSearcher:
             
             # 设置持久化数据目录（保存缓存、cookies等）
             import tempfile
-            user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache')
+            safe_account_key = ''.join(
+                character if character.isalnum() or character in ('-', '_') else '_'
+                for character in (self.cookie_id or 'default')
+            )[:80]
+            user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache', safe_account_key)
             os.makedirs(user_data_dir, exist_ok=True)
             logger.info(f"使用持久化数据目录（保留缓存）: {user_data_dir}")
             
@@ -982,6 +991,11 @@ class XianyuSearcher:
 
             # 解析商品信息
             title = await self.safe_get(main_data, "title", default="未知标题")
+            description = (
+                await self.safe_get(main_data, "description", default="")
+                or await self.safe_get(main_data, "desc", default="")
+                or await self.safe_get(main_data, "itemDescription", default="")
+            )
 
             # 价格处理
             price_parts = await self.safe_get(main_data, "price", default=[])
@@ -1054,6 +1068,7 @@ class XianyuSearcher:
             return {
                 "item_id": item_id,
                 "title": title,
+                "description": str(description or '').strip(),
                 "price": price,
                 "seller_name": seller,
                 "item_url": raw_link.replace("fleamarket://", "https://www.goofish.com/"),
@@ -1511,7 +1526,15 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
-async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+async def search_xianyu_items(
+    keyword: str,
+    page: int = 1,
+    page_size: int = 20,
+    *,
+    cookie_id: str = None,
+    cookie_value: str = None,
+    max_retries: int = 2,
+) -> Dict[str, Any]:
     """
     搜索闲鱼商品的便捷函数，带重试机制
 
@@ -1523,14 +1546,14 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
     Returns:
         搜索结果
     """
-    max_retries = 2
+    max_retries = max(0, min(int(max_retries or 0), 2))
     retry_delay = 5  # 秒，增加重试间隔
 
     for attempt in range(max_retries + 1):
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(cookie_id=cookie_id, cookie_value=cookie_value)
 
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_items(keyword, page, page_size)
@@ -1630,6 +1653,4 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         'total': 0,
         'error': "未知错误"
     }
-
-
 

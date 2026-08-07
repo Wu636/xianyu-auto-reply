@@ -1082,6 +1082,8 @@ Cookie数量: {cookie_count}
             self._ensure_scheduled_red_flower_logs_table(cursor)
             self._ensure_scheduled_task_logs_table(cursor)
             self._ensure_product_publish_tables(cursor)
+            self._ensure_quark_catalog_tables(cursor)
+            self._ensure_content_product_tables(cursor)
 
             # 迁移notification_templates表以支持新的模板类型
             self._migrate_notification_templates(cursor)
@@ -1291,6 +1293,77 @@ Cookie数量: {cookie_count}
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_user_time ON publish_logs(user_id, created_at DESC)")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_batch ON publish_logs(batch_id)")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_account_status ON publish_logs(account_id, status, created_at DESC)")
+
+    def _ensure_quark_catalog_tables(self, cursor):
+        """创建夸克目录自动上架流水线记录表。"""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS quark_catalog_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            quark_fid TEXT NOT NULL,
+            parent_fid TEXT NOT NULL DEFAULT '0',
+            folder_name TEXT NOT NULL,
+            fingerprint TEXT,
+            metadata_json TEXT,
+            share_id TEXT,
+            share_url TEXT,
+            share_password TEXT,
+            title TEXT,
+            description TEXT,
+            cover_sha256 TEXT,
+            material_id INTEGER,
+            card_id INTEGER,
+            delivery_rule_id INTEGER,
+            publish_log_id INTEGER,
+            xianyu_item_id TEXT,
+            status TEXT NOT NULL DEFAULT 'discovered',
+            error_message TEXT,
+            last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, quark_fid),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (material_id) REFERENCES product_materials(id) ON DELETE SET NULL,
+            FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE SET NULL,
+            FOREIGN KEY (delivery_rule_id) REFERENCES delivery_rules(id) ON DELETE SET NULL,
+            FOREIGN KEY (publish_log_id) REFERENCES publish_logs(id) ON DELETE SET NULL
+        )
+        ''')
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_quark_catalog_user_status ON quark_catalog_items(user_id, status, updated_at DESC)"
+        )
+
+    def _ensure_content_product_tables(self, cursor):
+        """Create records for link-to-product exports and generated packages."""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS content_products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source_url TEXT,
+            source_title TEXT,
+            source_excerpt TEXT,
+            rights_status TEXT NOT NULL DEFAULT 'reference_only',
+            output_mode TEXT NOT NULL DEFAULT 'bundle',
+            title TEXT,
+            description TEXT,
+            category TEXT,
+            price REAL,
+            original_price REAL,
+            material_id INTEGER,
+            package_dir TEXT,
+            package_zip TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            error_message TEXT,
+            metadata_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (material_id) REFERENCES product_materials(id) ON DELETE SET NULL
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_content_products_user_time ON content_products(user_id, created_at DESC)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_content_products_user_status ON content_products(user_id, status, updated_at DESC)")
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
@@ -5096,8 +5169,77 @@ Cookie数量: {cookie_count}
                         dr.id ASC
                     ''', (keyword, keyword, keyword))
 
+                rows = cursor.fetchall()
+
+                # 发布标题通常会被自动优化，可能只是在空格、竖线、括号等
+                # 标点上与规则关键词不同（例如“合集｜减脂餐”与“合集 减脂餐”）。
+                # 先保留原来的精确 SQL 匹配；精确匹配为空时，再做一次只忽略
+                # 标点/空白/大小写的兜底匹配，避免因为排版差异导致整单漏发。
+                if not rows and keyword:
+                    def _normalize_delivery_match_text(value: Any) -> str:
+                        text = str(value or '').strip().lower()
+                        # NFKC 统一全半角字符，再移除所有非字母、数字和中文字符。
+                        # 这样不会改变关键词语义，只消除标题排版造成的差异。
+                        try:
+                            import unicodedata
+                            text = unicodedata.normalize('NFKC', text)
+                        except Exception:
+                            pass
+                        return ''.join(
+                            ch for ch in text
+                            if ch.isalnum() or ('\u4e00' <= ch <= '\u9fff')
+                        )
+
+                    normalized_keyword = _normalize_delivery_match_text(keyword)
+                    if normalized_keyword:
+                        normalized_filter = (
+                            "AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)"
+                            if only_non_multi_spec else ""
+                        )
+                        if user_id is not None:
+                            cursor.execute(f'''
+                            SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                                   dr.description, dr.delivery_times,
+                                   c.name as card_name, c.type as card_type, c.api_config,
+                                   c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
+                                   c.delay_seconds as card_delay_seconds,
+                                   c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
+                            FROM delivery_rules dr
+                            LEFT JOIN cards c ON dr.card_id = c.id
+                            WHERE dr.enabled = 1 AND c.enabled = 1 AND dr.user_id = ?
+                            {normalized_filter}
+                            ''', (user_id,))
+                        else:
+                            cursor.execute(f'''
+                            SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                                   dr.description, dr.delivery_times,
+                                   c.name as card_name, c.type as card_type, c.api_config,
+                                   c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
+                                   c.delay_seconds as card_delay_seconds,
+                                   c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
+                            FROM delivery_rules dr
+                            LEFT JOIN cards c ON dr.card_id = c.id
+                            WHERE dr.enabled = 1 AND c.enabled = 1
+                            {normalized_filter}
+                            ''')
+
+                        normalized_rows = []
+                        for candidate in cursor.fetchall():
+                            normalized_rule = _normalize_delivery_match_text(candidate[1])
+                            if normalized_rule and (
+                                normalized_rule in normalized_keyword
+                                or normalized_keyword in normalized_rule
+                            ):
+                                normalized_rows.append(candidate)
+
+                        # 与原查询一致：更长的关键词优先；相同长度按规则 ID 稳定排序。
+                        normalized_rows.sort(
+                            key=lambda row: (-len(_normalize_delivery_match_text(row[1])), row[0])
+                        )
+                        rows = normalized_rows
+
                 rules = []
-                for row in cursor.fetchall():
+                for row in rows:
                     # 解析api_config JSON字符串
                     api_config = row[9]
                     if api_config:
@@ -6894,6 +7036,317 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"设置用户配置失败: {e}")
                 self.conn.rollback()
+                return False
+
+    # ==================== 夸克目录自动上架 ====================
+
+    def get_quark_catalog_settings(self, user_id: int, include_secrets: bool = False) -> Dict[str, Any]:
+        """读取夸克自动上架配置；配置整体加密保存。"""
+        setting = self.get_user_setting(user_id, 'quark_catalog.settings')
+        if not setting or not setting.get('value'):
+            return {}
+        try:
+            raw = self._decrypt_secret(setting['value'])
+            config = json.loads(raw)
+            if not isinstance(config, dict):
+                return {}
+        except Exception as e:
+            logger.error(f"读取夸克自动上架配置失败: {e}")
+            return {}
+
+        if include_secrets:
+            return config
+
+        masked = dict(config)
+        for field in ('quark_cookie', 'text_api_key', 'image_api_key'):
+            secret = str(config.get(field) or '').strip()
+            masked[f'{field}_configured'] = bool(secret)
+            if secret and field in {'text_api_key', 'image_api_key'}:
+                masked[f'{field}_hint'] = (
+                    f"末尾 …{secret[-4:]} · 指纹 {hashlib.sha256(secret.encode('utf-8')).hexdigest()[:8]}"
+                )
+            masked.pop(field, None)
+        return masked
+
+    def save_quark_catalog_settings(self, user_id: int, config: Dict[str, Any]) -> bool:
+        """合并并加密保存夸克自动上架配置；空密钥不会覆盖已有密钥。"""
+        existing = self.get_quark_catalog_settings(user_id, include_secrets=True)
+        merged = dict(existing)
+        for key, value in (config or {}).items():
+            if key in {'quark_cookie', 'text_api_key', 'image_api_key'} and not str(value or '').strip():
+                continue
+            merged[key] = value
+        encrypted = self._encrypt_secret(json.dumps(merged, ensure_ascii=False, default=str))
+        return self.set_user_setting(
+            user_id,
+            'quark_catalog.settings',
+            encrypted,
+            '夸克目录自动生成商品、分享链接和发货规则配置（加密）',
+        )
+
+    @staticmethod
+    def _row_to_quark_catalog_item(row, include_secrets: bool = False, decrypt_secret=None) -> Dict[str, Any]:
+        metadata = {}
+        try:
+            metadata = json.loads(row[6] or '{}')
+        except Exception:
+            metadata = {}
+        share_url = decrypt_secret(row[8]) if include_secrets and decrypt_secret else ''
+        share_password = decrypt_secret(row[9]) if include_secrets and decrypt_secret else ''
+        item = {
+            'id': row[0], 'user_id': row[1], 'quark_fid': row[2], 'parent_fid': row[3],
+            'folder_name': row[4], 'fingerprint': row[5], 'metadata': metadata,
+            'share_id': row[7], 'title': row[10], 'description': row[11],
+            'cover_sha256': row[12], 'material_id': row[13], 'card_id': row[14],
+            'delivery_rule_id': row[15], 'publish_log_id': row[16], 'xianyu_item_id': row[17],
+            'status': row[18], 'error_message': row[19], 'last_seen_at': row[20],
+            'created_at': row[21], 'updated_at': row[22],
+            'share_url_configured': bool(row[8]), 'share_password_configured': bool(row[9]),
+        }
+        if include_secrets:
+            item['share_url'] = share_url
+            item['share_password'] = share_password
+        return item
+
+    def get_quark_catalog_item(self, user_id: int, quark_fid: str, include_secrets: bool = False) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT id, user_id, quark_fid, parent_fid, folder_name, fingerprint,
+                           metadata_json, share_id, share_url, share_password, title, description,
+                           cover_sha256, material_id, card_id, delivery_rule_id, publish_log_id,
+                           xianyu_item_id, status, error_message, last_seen_at, created_at, updated_at
+                    FROM quark_catalog_items WHERE user_id = ? AND quark_fid = ?
+                ''', (user_id, str(quark_fid)))
+                row = cursor.fetchone()
+                return self._row_to_quark_catalog_item(row, include_secrets, self._decrypt_secret) if row else None
+            except Exception as e:
+                logger.error(f"读取夸克目录商品失败: {e}")
+                return None
+
+    def upsert_quark_catalog_item(self, user_id: int, quark_fid: str, data: Dict[str, Any]) -> Optional[int]:
+        """创建或更新目录记录，分享链接与提取码始终加密落库。"""
+        allowed = {
+            'parent_fid', 'folder_name', 'fingerprint', 'metadata_json', 'share_id',
+            'share_url', 'share_password', 'title', 'description', 'cover_sha256',
+            'material_id', 'card_id', 'delivery_rule_id', 'publish_log_id',
+            'xianyu_item_id', 'status', 'error_message',
+        }
+        payload = {key: value for key, value in (data or {}).items() if key in allowed}
+        if 'metadata_json' in payload and not isinstance(payload['metadata_json'], str):
+            payload['metadata_json'] = json.dumps(payload['metadata_json'], ensure_ascii=False, default=str)
+        for secret_field in ('share_url', 'share_password'):
+            if secret_field in payload:
+                payload[secret_field] = self._encrypt_secret(payload[secret_field])
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT id FROM quark_catalog_items WHERE user_id = ? AND quark_fid = ?",
+                    (user_id, str(quark_fid)),
+                )
+                row = cursor.fetchone()
+                if row:
+                    updates = [f"{key} = ?" for key in payload]
+                    values = list(payload.values())
+                    updates.extend(['last_seen_at = CURRENT_TIMESTAMP', 'updated_at = CURRENT_TIMESTAMP'])
+                    cursor.execute(
+                        f"UPDATE quark_catalog_items SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+                        tuple(values + [row[0], user_id]),
+                    )
+                    item_id = int(row[0])
+                else:
+                    required = {
+                        'parent_fid': str(payload.pop('parent_fid', '0') or '0'),
+                        'folder_name': str(payload.pop('folder_name', '') or '').strip(),
+                    }
+                    if not required['folder_name']:
+                        raise ValueError('夸克目录名称不能为空')
+                    insert_data = {**required, **payload}
+                    columns = ['user_id', 'quark_fid', *insert_data.keys()]
+                    values = [user_id, str(quark_fid), *insert_data.values()]
+                    placeholders = ','.join(['?'] * len(columns))
+                    cursor.execute(
+                        f"INSERT INTO quark_catalog_items ({','.join(columns)}) VALUES ({placeholders})",
+                        tuple(values),
+                    )
+                    item_id = int(cursor.lastrowid)
+                self.conn.commit()
+                return item_id
+            except Exception as e:
+                logger.error(f"保存夸克目录商品失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def list_quark_catalog_items(self, user_id: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        with self.lock:
+            try:
+                safe_page = max(1, int(page or 1))
+                safe_size = max(1, min(int(page_size or 20), 100))
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM quark_catalog_items WHERE user_id = ?", (user_id,))
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute('''
+                    SELECT id, user_id, quark_fid, parent_fid, folder_name, fingerprint,
+                           metadata_json, share_id, share_url, share_password, title, description,
+                           cover_sha256, material_id, card_id, delivery_rule_id, publish_log_id,
+                           xianyu_item_id, status, error_message, last_seen_at, created_at, updated_at
+                    FROM quark_catalog_items WHERE user_id = ?
+                    ORDER BY datetime(updated_at) DESC, id DESC LIMIT ? OFFSET ?
+                ''', (user_id, safe_size, (safe_page - 1) * safe_size))
+                rows = [self._row_to_quark_catalog_item(row) for row in cursor.fetchall()]
+                return {
+                    'list': rows, 'total': total, 'page': safe_page, 'page_size': safe_size,
+                    'total_pages': (total + safe_size - 1) // safe_size if total else 0,
+                }
+            except Exception as e:
+                logger.error(f"查询夸克目录商品失败: {e}")
+                return {'list': [], 'total': 0, 'page': page, 'page_size': page_size, 'total_pages': 0}
+
+    def reset_quark_catalog_item_material(self, user_id: int, quark_fid: str) -> bool:
+        """删除未发布目录的生成结果，使下次同步重新生成素材。
+
+        永久分享信息与卡券会保留复用；已有自动发货规则会先停用，
+        等新素材生成成功后再由流水线更新标题并重新启用。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT material_id, delivery_rule_id, status, xianyu_item_id, metadata_json
+                    FROM quark_catalog_items
+                    WHERE user_id = ? AND quark_fid = ?
+                ''', (user_id, str(quark_fid)))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                material_id, delivery_rule_id, status, xianyu_item_id, metadata_json = row
+                if xianyu_item_id or status == 'published':
+                    raise ValueError('已发布商品不能删除生成素材')
+
+                metadata = self._json_loads_safe(metadata_json, {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                for field in ('market_research', 'selected_price', 'pricing_basis'):
+                    metadata.pop(field, None)
+
+                if delivery_rule_id:
+                    cursor.execute('''
+                        UPDATE delivery_rules
+                        SET enabled = 0, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (delivery_rule_id,))
+                if material_id:
+                    cursor.execute(
+                        "DELETE FROM product_materials WHERE id = ? AND user_id = ?",
+                        (material_id, user_id),
+                    )
+
+                cursor.execute('''
+                    UPDATE quark_catalog_items
+                    SET title = NULL,
+                        description = NULL,
+                        cover_sha256 = NULL,
+                        material_id = NULL,
+                        publish_log_id = NULL,
+                        status = 'discovered',
+                        error_message = NULL,
+                        metadata_json = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND quark_fid = ?
+                      AND status != 'published'
+                      AND (xianyu_item_id IS NULL OR xianyu_item_id = '')
+                ''', (self._json_dumps_safe(metadata), user_id, str(quark_fid)))
+                if cursor.rowcount <= 0:
+                    self.conn.rollback()
+                    return False
+                self.conn.commit()
+                return True
+            except ValueError:
+                self.conn.rollback()
+                raise
+            except Exception as e:
+                logger.error(f"删除夸克目录生成素材失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def delete_quark_catalog_item(self, user_id: int, quark_fid: str) -> bool:
+        """删除夸克目录列表中的整行记录。
+
+        未发布记录会同时清理其专属生成素材，并停用不再使用的发货规则；
+        已发布记录只移除本地目录行，不影响闲鱼上已经发布的商品。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT id, material_id, delivery_rule_id, status, xianyu_item_id
+                    FROM quark_catalog_items
+                    WHERE user_id = ? AND quark_fid = ?
+                ''', (user_id, str(quark_fid)))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+
+                catalog_id, material_id, delivery_rule_id, status, xianyu_item_id = row
+                is_published = bool(xianyu_item_id or status == 'published')
+
+                # 同一素材/规则若被其他目录记录复用，保留它们，避免误删用户数据。
+                if not is_published and material_id:
+                    cursor.execute('''
+                        SELECT COUNT(*) FROM quark_catalog_items
+                        WHERE user_id = ? AND material_id = ? AND id != ?
+                    ''', (user_id, material_id, catalog_id))
+                    material_references = int(cursor.fetchone()[0] or 0)
+                    if material_references == 0:
+                        cursor.execute(
+                            "DELETE FROM product_materials WHERE id = ? AND user_id = ?",
+                            (material_id, user_id),
+                        )
+
+                if not is_published and delivery_rule_id:
+                    cursor.execute('''
+                        SELECT COUNT(*) FROM quark_catalog_items
+                        WHERE user_id = ? AND delivery_rule_id = ? AND id != ?
+                    ''', (user_id, delivery_rule_id, catalog_id))
+                    rule_references = int(cursor.fetchone()[0] or 0)
+                    if rule_references == 0:
+                        cursor.execute('''
+                            UPDATE delivery_rules
+                            SET enabled = 0, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ? AND user_id = ?
+                        ''', (delivery_rule_id, user_id))
+
+                cursor.execute(
+                    "DELETE FROM quark_catalog_items WHERE id = ? AND user_id = ?",
+                    (catalog_id, user_id),
+                )
+                if cursor.rowcount <= 0:
+                    self.conn.rollback()
+                    return False
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"删除夸克目录记录失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def quark_catalog_title_exists(self, user_id: int, title: str, exclude_fid: str = None) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                params: List[Any] = [user_id, str(title or '').strip()]
+                sql = "SELECT 1 FROM quark_catalog_items WHERE user_id = ? AND title = ?"
+                if exclude_fid is not None:
+                    sql += " AND quark_fid != ?"
+                    params.append(str(exclude_fid))
+                sql += " LIMIT 1"
+                cursor.execute(sql, tuple(params))
+                return cursor.fetchone() is not None
+            except Exception as e:
+                logger.error(f"检查夸克商品标题重复失败: {e}")
                 return False
 
     # ==================== 管理员专用方法 ====================
@@ -10044,6 +10497,22 @@ Cookie数量: {cookie_count}
                 return None
 
     def _row_to_product_material(self, row) -> Dict[str, Any]:
+        images = self._json_loads_safe(row[7], [])
+        if isinstance(images, list):
+            normalized_images = []
+            for image in images:
+                if isinstance(image, dict):
+                    image = dict(image)
+                    # AI-generated covers are persisted as raw Base64 in
+                    # ``content``.  The original publishing UI reads ``data``;
+                    # normalize the API representation so both old cached
+                    # clients and the current client can render the image.
+                    if image.get('content') and not any(
+                        image.get(key) for key in ('url', 'image_url', 'src', 'data', 'base64')
+                    ):
+                        image['data'] = image.pop('content')
+                normalized_images.append(image)
+            images = normalized_images
         return {
             'id': row[0],
             'user_id': row[1],
@@ -10052,7 +10521,7 @@ Cookie数量: {cookie_count}
             'price': row[4],
             'original_price': row[5],
             'category': row[6],
-            'images': self._json_loads_safe(row[7], []),
+            'images': images,
             'delivery_method': row[8],
             'postage': row[9],
             'can_self_pickup': bool(row[10]),
@@ -10337,6 +10806,44 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"查询商品发布日志失败: {e}")
                 return {'list': [], 'total': 0, 'page': page, 'page_size': page_size, 'total_pages': 0}
+
+    def get_publish_log_by_item_id(self, item_id: str, account_id: str = None,
+                                   user_id: int = None) -> Optional[Dict[str, Any]]:
+        """按闲鱼商品 ID 获取最近一次成功发布记录。
+
+        商品发布成功后，平台的商品列表接口可能暂时返回风控/限流错误，
+        导致 item_info 尚未建立。自动发货仍需要标题和详情来匹配规则，
+        因此这里提供发布日志作为可靠的本地兜底来源。
+        """
+        clean_item_id = str(item_id or '').strip()
+        if not clean_item_id:
+            return None
+        with self.lock:
+            try:
+                conditions = ['item_id = ?', "status = 'success'"]
+                params: List[Any] = [clean_item_id]
+                if account_id:
+                    conditions.append('account_id = ?')
+                    params.append(str(account_id))
+                if user_id is not None:
+                    conditions.append('user_id = ?')
+                    params.append(user_id)
+                where_sql = ' AND '.join(conditions)
+                cursor = self.conn.cursor()
+                cursor.execute(f'''
+                    SELECT id, user_id, account_id, title, description, price, material_id, batch_id,
+                           status, item_url, item_id, error_message, sync_status, sync_message,
+                           sync_total_count, sync_saved_count, raw_response, created_at, updated_at
+                    FROM publish_logs
+                    WHERE {where_sql}
+                    ORDER BY datetime(updated_at) DESC, id DESC
+                    LIMIT 1
+                ''', tuple(params))
+                row = cursor.fetchone()
+                return self._row_to_publish_log(row) if row else None
+            except Exception as e:
+                logger.error(f"按商品ID查询发布记录失败: item_id={clean_item_id}, error={e}")
+                return None
 
     def get_publish_batch_status(self, batch_id: str, user_id: int) -> Dict[str, Any]:
         """查询批量发布状态。"""
@@ -11253,6 +11760,123 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"查询上下文消息过滤规则失败: {e}")
                 return []
+
+    # ==================== 链接商品化记录 ====================
+
+    @staticmethod
+    def _content_product_row_to_dict(row) -> Dict[str, Any]:
+        if not row:
+            return {}
+        columns = (
+            'id', 'user_id', 'source_url', 'source_title', 'source_excerpt',
+            'rights_status', 'output_mode', 'title', 'description', 'category',
+            'price', 'original_price', 'material_id', 'package_dir', 'package_zip',
+            'status', 'error_message', 'metadata_json', 'created_at', 'updated_at',
+        )
+        data = dict(zip(columns, row))
+        data['metadata'] = DBManager._json_loads_safe(data.pop('metadata_json'), {}) or {}
+        return data
+
+    def add_content_product(self, user_id: int, data: Dict[str, Any]) -> Optional[int]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    INSERT INTO content_products (
+                        user_id, source_url, source_title, source_excerpt, rights_status,
+                        output_mode, title, description, category, price, original_price,
+                        material_id, package_dir, package_zip, status, error_message, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id, data.get('source_url'), data.get('source_title'), data.get('source_excerpt'),
+                    data.get('rights_status') or 'reference_only', data.get('output_mode') or 'bundle',
+                    data.get('title'), data.get('description'), data.get('category'), data.get('price'),
+                    data.get('original_price'), data.get('material_id'), data.get('package_dir'),
+                    data.get('package_zip'), data.get('status') or 'draft', data.get('error_message'),
+                    self._json_dumps_safe(data.get('metadata') or {}),
+                ))
+                product_id = cursor.lastrowid
+                self.conn.commit()
+                return int(product_id)
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"新增链接商品化记录失败: {exc}")
+                return None
+
+    def get_content_product(self, product_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT id, user_id, source_url, source_title, source_excerpt, rights_status, output_mode, title, description, category, price, original_price, material_id, package_dir, package_zip, status, error_message, metadata_json, created_at, updated_at FROM content_products WHERE id = ? AND user_id = ?",
+                    (int(product_id), int(user_id)),
+                )
+                row = cursor.fetchone()
+                return self._content_product_row_to_dict(row) if row else None
+            except Exception as exc:
+                logger.error(f"查询链接商品化记录失败: {exc}")
+                return None
+
+    def list_content_products(self, user_id: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 20), 100))
+        offset = (page - 1) * page_size
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT COUNT(*) FROM content_products WHERE user_id = ?", (int(user_id),))
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute(
+                    "SELECT id, user_id, source_url, source_title, source_excerpt, rights_status, output_mode, title, description, category, price, original_price, material_id, package_dir, package_zip, status, error_message, metadata_json, created_at, updated_at FROM content_products WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (int(user_id), page_size, offset),
+                )
+                items = [self._content_product_row_to_dict(row) for row in cursor.fetchall()]
+                return {'items': items, 'total': total, 'page': page, 'page_size': page_size, 'pages': (total + page_size - 1) // page_size}
+            except Exception as exc:
+                logger.error(f"查询链接商品化列表失败: {exc}")
+                return {'items': [], 'total': 0, 'page': page, 'page_size': page_size, 'pages': 0}
+
+    def update_content_product(self, product_id: int, user_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {
+            'source_url', 'source_title', 'source_excerpt', 'rights_status', 'output_mode',
+            'title', 'description', 'category', 'price', 'original_price', 'material_id',
+            'package_dir', 'package_zip', 'status', 'error_message', 'metadata',
+        }
+        updates = {key: value for key, value in data.items() if key in allowed}
+        if not updates:
+            return False
+        fields = []
+        params = []
+        for key, value in updates.items():
+            column = 'metadata_json' if key == 'metadata' else key
+            fields.append(f"{column} = ?")
+            params.append(self._json_dumps_safe(value or {}) if key == 'metadata' else value)
+        fields.append('updated_at = CURRENT_TIMESTAMP')
+        params.extend([int(product_id), int(user_id)])
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(f"UPDATE content_products SET {', '.join(fields)} WHERE id = ? AND user_id = ?", params)
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"更新链接商品化记录失败: {exc}")
+                return False
+
+    def delete_content_product(self, product_id: int, user_id: int) -> bool:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("DELETE FROM content_products WHERE id = ? AND user_id = ?", (int(product_id), int(user_id)))
+                deleted = cursor.rowcount > 0
+                self.conn.commit()
+                return deleted
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"删除链接商品化记录失败: {exc}")
+                return False
 
 
 # 全局单例

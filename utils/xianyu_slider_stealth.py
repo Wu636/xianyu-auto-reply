@@ -5466,11 +5466,18 @@ class XianyuSliderStealth:
                         f"【{self.pure_user_id}】{scene}前回访 goofish 主域失败，仍按当前页 cookie 继续: {goto_e}"
                     )
 
-        cookies_dict = self._snapshot_context_cookies(
-            context,
-            page=target_page,
-            preferred_domain_suffixes=('goofish.com',),
-        )
+        try:
+            cookies_dict = self._snapshot_context_cookies(
+                context,
+                page=target_page,
+                preferred_domain_suffixes=('goofish.com',),
+            )
+        except TypeError as snapshot_error:
+            # Keep compatibility with lightweight test doubles and older
+            # integrations that still expose the two-argument snapshot hook.
+            if 'preferred_domain_suffixes' not in str(snapshot_error):
+                raise
+            cookies_dict = self._snapshot_context_cookies(context, page=target_page)
         if extra_cookie_updates:
             merged_from_network = dict(cookies_dict)
             merged_from_network.update(extra_cookie_updates)

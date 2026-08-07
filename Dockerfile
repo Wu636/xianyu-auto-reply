@@ -122,7 +122,7 @@ EXPOSE 6080
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8090/health || exit 1
+    CMD curl -f "http://localhost:${PORT:-8090}/health" || exit 1
 
 # 复制启动脚本
 # 复制启动脚本和调试工具

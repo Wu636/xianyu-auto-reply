@@ -19,6 +19,7 @@
 - **智能回复**：支持关键词回复、默认回复、指定商品回复、图片关键词和 AI 自动回复。
 - **自动发货**：支持文本、批量数据、API、图片等发货方式，并提供防重复处理能力。
 - **商品管理**：自动收集商品信息，支持商品详情、规格配置和数据去重。
+- **链接商品化**：从公开文章链接或粘贴正文生成可编辑商品文案、AI 封面、Markdown 文档与 Skill 组合包，并可载入发布表单。
 - **运营协同**：提供订单管理、通知渠道、消息通知、在线客服等后台运营能力。
 - **监控维护**：支持实时日志、健康检查、安全统计、系统统计和日志文件轮转。
 - **容器化部署**：支持本地运行、Docker Compose 和多架构构建。
@@ -57,6 +58,10 @@ python Start.py
 
 默认访问：`http://localhost:8090`
 
+### 常驻服务器部署
+
+自动回复、WebSocket、定时同步和自动发货需要持续运行的进程。Vercel 更适合短请求前端，完整服务请使用 Docker 主机、Render、Railway、Fly.io 或 VPS。项目已提供 `docker-compose.server.yml`、`docker-server-deploy.sh` 和 `render.yaml`，详见[部署与运行指南](docs/deployment.md)。
+
 > 更多部署方式、Windows 脚本、国内 Docker Compose 配置、多架构构建和访问地址见 [部署与运行指南](docs/deployment.md)。
 
 ## 🤖 AI 回复配置
@@ -69,10 +74,12 @@ AI 回复使用统一的 `model_name` / `api_key` / `base_url` / `api_type` 配�
 
 | 文档 | 内容 |
 | --- | --- |
-| [部署与运行指南](docs/deployment.md) | Docker、本地运行、环境要求、多架构、访问地址 |
+| [部署与运行指南](docs/deployment.md) | Docker、本地运行、常驻服务器、环境要求、多架构、访问地址 |
 | [配置说明](docs/configuration.md) | 环境变量、`global_config.yml`、AI 回复配置、运行期目录 |
 | [使用指南](docs/usage.md) | 用户注册、添加账号、自动回复、自动发货 |
 | [常见问题](docs/faq.md) | 端口、数据库、WebSocket、Playwright、Docker、Windows 问题 |
+
+“链接商品化”页面支持把文章链接或粘贴的长文整理成 Markdown、Skill 或组合 ZIP，生成标题、商品介绍、封面和可编辑发布素材；填写永久分享链接后还会同步创建文本卡券与自动发货规则。
 | [发版与热更新说明](docs/release.md) | 热更新清单、版本号、`release_precheck.py`、Release 流程 |
 | [安全政策](SECURITY.md) | 安全问题反馈和处理方式 |
 
@@ -157,6 +164,9 @@ docker compose up -d
 ```
 
 更多问题见 [常见问题](docs/faq.md)。
+
+夸克网盘目录生成商品、AI 封面、分享链接与自动发货的配置方法见
+[夸克网盘 AI 自动上架](docs/quark-catalog.md)。
 
 ## 🧸 特别鸣谢
 

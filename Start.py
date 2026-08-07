@@ -10,6 +10,31 @@ import sys
 import shutil
 from pathlib import Path
 
+
+def _configure_ssl_ca_bundle():
+    """Give aiohttp a trusted CA bundle when Python has none configured.
+
+    Python.org macOS installations can have an empty OpenSSL CA path.  Keep a
+    user-supplied SSL_CERT_FILE untouched, otherwise use certifi so HTTPS
+    verification remains enabled for the Goofish API clients.
+    """
+    if os.getenv('SSL_CERT_FILE'):
+        return
+
+    try:
+        import certifi
+
+        ca_bundle = certifi.where()
+        if ca_bundle and os.path.isfile(ca_bundle):
+            os.environ['SSL_CERT_FILE'] = ca_bundle
+    except Exception:
+        # Do not prevent startup on minimal or packaged installations. In that
+        # case Python retains its existing certificate configuration.
+        pass
+
+
+_configure_ssl_ca_bundle()
+
 # 设置标准输出编码为UTF-8（Windows兼容）
 def _setup_console_encoding():
     """设置控制台编码为UTF-8，避免Windows GBK编码问题"""
@@ -446,18 +471,20 @@ def _start_api_server():
     """后台线程启动 FastAPI 服务"""
     api_conf = AUTO_REPLY.get('api', {})
 
-    # 优先使用环境变量配置
-    host = os.getenv('API_HOST', '0.0.0.0')  # 默认绑定所有接口
-    port = int(os.getenv('API_PORT', '8090'))  # 默认端口8090
+    # 本地沿用 global_config.yml；云平台的 PORT/API_HOST/API_PORT 优先级更高。
+    env_host = os.getenv('API_HOST')
+    env_port = os.getenv('PORT') or os.getenv('API_PORT')
+    host = env_host or '0.0.0.0'
+    port = int(env_port or '8090')
 
     # 如果配置文件中有特定配置，则使用配置文件
-    if 'host' in api_conf:
+    if not env_host and 'host' in api_conf:
         host = api_conf['host']
-    if 'port' in api_conf:
+    if not env_port and 'port' in api_conf:
         port = api_conf['port']
 
     # 兼容旧的URL配置方式
-    if 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:
+    if not env_port and not env_host and 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:
         url = api_conf.get('url', 'http://0.0.0.0:8090/xianyu/reply')
         parsed = urlparse(url)
         if parsed.hostname and parsed.hostname != 'localhost':

@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: xianyu-auto-reply
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: xianyu-data
+      mountPath: /app/data
+      sizeGB: 10
+    envVars:
+      - key: TZ
+        value: Asia/Shanghai
+      - key: DB_PATH
+        value: /app/data/xianyu_data.db
+      - key: XIANYU_DATA_DIR
+        value: /app/data
+      - key: USE_XVFB
+        value: "true"
+      - key: ENABLE_HEADFUL
+        value: "true"
+      - key: ENABLE_VNC
+        value: "false"
+      - key: SECRET_ENCRYPTION_KEY
+        generateValue: true
+      - key: JWT_SECRET_KEY
+        generateValue: true
