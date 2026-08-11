@@ -4,8 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from cryptography.fernet import Fernet
 
 from auto_updater import AutoUpdater, DeletedFile, FileUpdate
+from db_manager import DBManager
 from utils.project_guard import ProjectIntegrityError, ensure_project_root
 
 
@@ -50,6 +52,15 @@ class ProjectRootGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ProjectIntegrityError):
                 ensure_project_root(Path(directory))
+
+
+class SecretRecoveryTests(unittest.TestCase):
+    def test_secret_from_lost_key_is_treated_as_unconfigured(self):
+        old_cipher = Fernet(Fernet.generate_key())
+        manager = DBManager.__new__(DBManager)
+        manager.secret_fernet = Fernet(Fernet.generate_key())
+        ciphertext = "enc$" + old_cipher.encrypt(b"sensitive-cookie").decode("utf-8")
+        self.assertEqual(manager._decrypt_secret(ciphertext), "")
 
 
 if __name__ == "__main__":

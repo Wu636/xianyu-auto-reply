@@ -64,16 +64,7 @@ else
 fi
 
 health_url="http://127.0.0.1:8090/"
-for _ in $(seq 1 60); do
-    if [ "$launch_mode" = "screen" ]; then
-        if ! screen -ls 2>/dev/null | grep -q '[.]xianyu8090'; then
-            echo "启动会话已退出，请检查 realtime.log"
-            exit 4
-        fi
-    elif ! kill -0 "$server_pid" 2>/dev/null; then
-        echo "启动进程已退出，请检查 realtime.log"
-        exit 4
-    fi
+for attempt in $(seq 1 60); do
     if curl -fsS --max-time 2 "$health_url" >/dev/null 2>&1; then
         listening_pid="$(lsof -tiTCP:8090 -sTCP:LISTEN 2>/dev/null | head -n 1)"
         printf '%s\n' "$listening_pid" > "$PROJECT_DIR/.server.pid"
@@ -87,6 +78,17 @@ for _ in $(seq 1 60); do
         echo "  完整性看守已启用"
         echo "========================================"
         exit 0
+    fi
+    if [ "$launch_mode" = "screen" ]; then
+        # screen 的 socket 在 macOS 上偶尔会比子进程晚数秒出现。给会话一个
+        # 明确的启动宽限期，避免服务其实已启动却被脚本误报为退出。
+        if [ "$attempt" -gt 10 ] && ! screen -ls 2>/dev/null | grep -q '[.]xianyu8090'; then
+            echo "启动会话已退出，请检查 realtime.log"
+            exit 4
+        fi
+    elif ! kill -0 "$server_pid" 2>/dev/null; then
+        echo "启动进程已退出，请检查 realtime.log"
+        exit 4
     fi
     sleep 1
 done

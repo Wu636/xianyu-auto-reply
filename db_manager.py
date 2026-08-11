@@ -125,8 +125,10 @@ class DBManager:
         try:
             return self.secret_fernet.decrypt(text[4:].encode('utf-8')).decode('utf-8')
         except InvalidToken:
-            logger.warning("检测到无法解密的敏感字段，按原值返回")
-            return text
+            # 加密密钥遗失或更换时，密文原值既不是可用 Cookie，也不应继续
+            # 传入解析器/日志。按未配置处理，用户在后台重存后会使用新密钥。
+            logger.warning("检测到敏感字段所用加密密钥已变化，按未配置处理，请在后台重新保存")
+            return ''
 
     def _migrate_plaintext_cookie_secrets(self):
         """将 cookies 表中的明文敏感字段迁移为密文存储。"""
