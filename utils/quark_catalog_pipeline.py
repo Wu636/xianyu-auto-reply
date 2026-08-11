@@ -709,6 +709,9 @@ class CatalogAIClient:
         image_api_key: str,
         image_model: str,
         image_size: str = "1024x1024",
+        vision_base_url: str = "",
+        vision_api_key: str = "",
+        vision_model: str = "",
         timeout_seconds: float = 90.0,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
@@ -719,6 +722,13 @@ class CatalogAIClient:
         self.image_api_key = str(image_api_key or "").strip()
         self.image_model = str(image_model or "").strip()
         self.image_size = str(image_size or "1024x1024").strip()
+        # Vision analysis is intentionally independent from copywriting.  A
+        # text-only DeepSeek model can write the article while a multimodal
+        # model reviews source images.  Empty vision fields inherit the text
+        # configuration for backwards compatibility.
+        self.vision_base_url = str(vision_base_url or self.text_base_url).strip().rstrip("/")
+        self.vision_api_key = str(vision_api_key or self.text_api_key).strip()
+        self.vision_model = str(vision_model or self.text_model).strip()
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds),
             follow_redirects=True,
@@ -805,8 +815,10 @@ class CatalogAIClient:
             raise CatalogAIError(f"文案生成失败: HTTP {response.status_code} {response.text[:500]}")
         try:
             api_payload = response.json()
-            content = api_payload["choices"][0]["message"]["content"]
-            return parse_json_object(content)
+            message = api_payload["choices"][0]["message"]
+            return parse_chat_message_json(message)
+        except CatalogAIError:
+            raise
         except Exception as exc:
             raise CatalogAIError(f"文案模型返回格式异常: {response.text[:800]}") from exc
 
@@ -826,22 +838,22 @@ class CatalogAIClient:
         to fall back to deterministic image-review rules instead of pretending
         that a text-only model inspected the pixels.
         """
-        if not self.text_model:
-            raise CatalogAIError("文案模型不能为空")
+        if not self.vision_model:
+            raise CatalogAIError("视觉识图模型不能为空")
         clean_images = [str(item or "").strip() for item in (image_urls or []) if str(item or "").strip()]
         if not clean_images:
             return await self.generate_json(
                 system_prompt, user_prompt, temperature=temperature, max_tokens=max_tokens
             )
-        endpoint = self._api_endpoint(self.text_base_url, "chat/completions")
-        headers = self._auth_headers(self.text_api_key)
+        endpoint = self._api_endpoint(self.vision_base_url, "chat/completions")
+        headers = self._auth_headers(self.vision_api_key)
         content: List[Dict[str, Any]] = [{"type": "text", "text": str(user_prompt or "")}]
         content.extend({
             "type": "image_url",
             "image_url": {"url": image_url, "detail": "low"},
         } for image_url in clean_images[:12])
         payload: Dict[str, Any] = {
-            "model": self.text_model,
+            "model": self.vision_model,
             "temperature": float(temperature),
             "response_format": {"type": "json_object"},
             "messages": [
@@ -866,7 +878,9 @@ class CatalogAIClient:
             )
         try:
             api_payload = response.json()
-            return parse_json_object(api_payload["choices"][0]["message"]["content"])
+            return parse_chat_message_json(api_payload["choices"][0]["message"])
+        except CatalogAIError:
+            raise
         except Exception as exc:
             raise CatalogAIError(f"来源图片识别返回格式异常: {response.text[:800]}") from exc
 
@@ -1245,6 +1259,54 @@ class CatalogAIClient:
         return result
 
 
+def _chat_content_text(value: Any) -> str:
+    """Normalize OpenAI-compatible string and content-block responses."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content") or item.get("output_text")
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts).strip()
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("content") or value.get("output_text") or "").strip()
+    return str(value or "").strip()
+
+
+def parse_chat_message_json(message: Any) -> Dict[str, Any]:
+    """Read final JSON from normal or reasoning-style chat responses.
+
+    Some OpenAI-compatible gateways expose the generated result in
+    ``reasoning_content`` while leaving ``content`` empty.  Accept valid JSON
+    from either field, but do not silently treat free-form chain-of-thought as
+    the requested final object.
+    """
+    if not isinstance(message, dict):
+        raise CatalogAIError("模型响应缺少 message 对象")
+    content = _chat_content_text(message.get("content"))
+    reasoning = _chat_content_text(message.get("reasoning_content"))
+    errors: List[Exception] = []
+    for candidate in (content, reasoning):
+        if not candidate:
+            continue
+        try:
+            return parse_json_object(candidate)
+        except Exception as exc:
+            errors.append(exc)
+    if not content and reasoning:
+        raise CatalogAIError(
+            "当前模型只返回了思考过程，没有输出最终 JSON。请在“AI 模型配置”中改用支持非流式 JSON 输出的文案模型，或关闭供应商的思考模式。"
+        )
+    if not content and not reasoning:
+        raise CatalogAIError("模型返回内容为空，请检查模型名称、余额或输出长度限制")
+    raise CatalogAIError("模型返回了文本，但其中没有完整的 JSON 对象") from (errors[-1] if errors else None)
+
+
 def parse_json_object(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -1254,11 +1316,19 @@ def parse_json_object(value: Any) -> Dict[str, Any]:
         text = re.sub(r"\s*```$", "", text)
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise
-        payload = json.loads(match.group(0))
+    except json.JSONDecodeError as original_error:
+        payload = None
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", text):
+            try:
+                candidate, _ = decoder.raw_decode(text[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+        if payload is None:
+            raise original_error
     if not isinstance(payload, dict):
         raise ValueError("JSON 根节点必须是对象")
     return payload

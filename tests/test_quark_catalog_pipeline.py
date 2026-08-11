@@ -14,6 +14,7 @@ from utils.quark_catalog_pipeline import (
     QuarkEntry,
     build_folder_fingerprint,
     choose_listing_price,
+    parse_chat_message_json,
     parse_json_object,
     sanitize_title,
     summarize_market_items,
@@ -139,6 +140,44 @@ class CatalogAIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((cover['width'], cover['height']), (16, 16))
         self.assertTrue(cover['content'])
 
+    async def test_accepts_json_from_reasoning_content_when_final_content_is_empty(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={'choices': [{'message': {
+                'content': '',
+                'reasoning_content': '分析完成。最终结果：\n```json\n{"ok":true,"message":"兼容成功"}\n```',
+            }}]})
+
+        async with CatalogAIClient(
+            text_base_url='https://example.test/v1', text_api_key='key', text_model='reasoning-model',
+            image_base_url='https://example.test/v1', image_api_key='key', image_model='image-model',
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            result = await client.generate_json('只输出 JSON', '测试')
+
+        self.assertTrue(result['ok'])
+
+    async def test_multimodal_request_uses_dedicated_vision_model(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen['host'] = request.url.host
+            seen['payload'] = json.loads(request.content.decode('utf-8'))
+            return httpx.Response(200, json={'choices': [{'message': {'content': '{"ok":true}'}}]})
+
+        async with CatalogAIClient(
+            text_base_url='https://text.example/v1', text_api_key='text-key', text_model='text-model',
+            vision_base_url='https://vision.example/v1', vision_api_key='vision-key', vision_model='vision-model',
+            image_base_url='https://image.example/v1', image_api_key='image-key', image_model='image-model',
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            result = await client.generate_json_with_images(
+                '只输出 JSON', '看图', ['data:image/png;base64,' + _tiny_png_base64()]
+            )
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(seen['host'], 'vision.example')
+        self.assertEqual(seen['payload']['model'], 'vision-model')
+
     async def test_generates_with_real_reference_image(self):
         image_b64 = _tiny_png_base64()
         calls = []
@@ -201,6 +240,7 @@ class CatalogHelperTests(unittest.TestCase):
 
     def test_json_and_title_cleanup(self):
         self.assertEqual(parse_json_object('```json\n{"title":"测试"}\n```')['title'], '测试')
+        self.assertEqual(parse_chat_message_json({'content': [{'type': 'text', 'text': '{"ok":true}'}]})['ok'], True)
         self.assertEqual(sanitize_title('  好商品\n介绍！！', max_chars=12), '好商品 介绍')
 
     def test_market_summary_uses_real_hot_samples_and_robust_price(self):

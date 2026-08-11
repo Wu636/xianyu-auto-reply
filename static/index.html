@@ -101,6 +101,12 @@
           <span>IP 内容工厂</span>
         </a>
       </div>
+      <div class="nav-item" data-menu-id="ai-model-settings">
+        <a href="javascript:void(0)" class="nav-link" onclick="showSection('ai-model-settings')">
+          <i class="bi bi-cpu"></i>
+          <span>AI 模型配置</span>
+        </a>
+      </div>
       <div class="nav-item" data-menu-id="items">
         <a href="javascript:void(0)" class="nav-link" onclick="showSection('items')">
           <i class="bi bi-box-seam"></i>
@@ -965,37 +971,16 @@
                   <textarea class="form-control" id="quarkCatalogCookie" rows="2" placeholder="留空表示保留已保存的 Cookie"></textarea>
                   <div class="form-text" id="quarkCatalogCookieState">尚未配置</div>
                 </div>
-                <div class="col-md-4">
-                  <label class="form-label" for="quarkTextBaseUrl">文案 API 地址</label>
-                  <input class="form-control" id="quarkTextBaseUrl" value="https://api.openai.com/v1">
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label" for="quarkTextModel">文案模型</label>
-                  <input class="form-control" id="quarkTextModel" value="gpt-5-mini">
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label" for="quarkTextApiKey">文案 API Key</label>
-                  <div class="input-group">
-                    <input type="password" class="form-control" id="quarkTextApiKey" name="quark_text_api_key_new" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" readonly placeholder="已保存的 Key 不会显示">
-                    <button class="btn btn-outline-primary" id="quarkTextApiKeyEditButton" type="button" onclick="enableQuarkCatalogSecretEdit('text_api_key')">修改</button>
+                <div class="col-12">
+                  <div class="alert alert-primary d-flex flex-wrap justify-content-between align-items-center gap-2 mb-0">
+                    <div>
+                      <i class="bi bi-cpu me-1"></i>
+                      文案、识图与生图已改为全系统共用配置，商品发布页只保留夸克与定价参数。
+                    </div>
+                    <button class="btn btn-sm btn-primary" type="button" onclick="showSection('ai-model-settings')">
+                      打开 AI 模型配置
+                    </button>
                   </div>
-                  <div class="form-text" id="quarkTextApiKeyState">尚未配置</div>
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label" for="quarkImageBaseUrl">生图 API 地址</label>
-                  <input class="form-control" id="quarkImageBaseUrl" value="https://api.openai.com/v1">
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label" for="quarkImageModel">生图模型</label>
-                  <input class="form-control" id="quarkImageModel" value="gpt-image-1">
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label" for="quarkImageApiKey">生图 API Key</label>
-                  <div class="input-group">
-                    <input type="password" class="form-control" id="quarkImageApiKey" name="quark_image_api_key_new" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" readonly placeholder="已保存的 Key 不会显示">
-                    <button class="btn btn-outline-primary" id="quarkImageApiKeyEditButton" type="button" onclick="enableQuarkCatalogSecretEdit('image_api_key')">修改</button>
-                  </div>
-                  <div class="form-text" id="quarkImageApiKeyState">尚未配置；首次可复用文案 Key</div>
                 </div>
                 <div class="col-md-3">
                   <label class="form-label" for="quarkCatalogPrice">默认售价</label>
@@ -4091,6 +4076,129 @@
             </div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- 通用 AI 模型配置 -->
+    <div id="ai-model-settings-section" class="content-section">
+      <div class="content-header">
+        <div>
+          <h2 class="mb-0"><i class="bi bi-cpu me-2"></i>AI 模型配置</h2>
+          <p class="text-muted mb-0">一处配置，全系统的商品生成、链接商品化、IP 内容工厂与视觉素材库共同使用</p>
+        </div>
+      </div>
+      <div class="content-body">
+        <div class="alert alert-info">
+          <i class="bi bi-info-circle me-1"></i>
+          三类模型相互独立：文案模型负责标题与文章，视觉识图模型负责分析原文配图，生图模型负责封面和 IP 配图。所有 Key 均加密保存，刷新和重启后继续生效。
+        </div>
+        <div class="row g-4">
+          <div class="col-xl-4 d-flex">
+            <div class="card flex-fill">
+              <div class="card-header"><i class="bi bi-chat-square-text me-2"></i>1. 文案模型</div>
+              <div class="card-body">
+                <div class="mb-3">
+                  <label class="form-label" for="aiTextBaseUrl">API 地址</label>
+                  <input class="form-control" id="aiTextBaseUrl" placeholder="https://api.openai.com/v1">
+                  <div class="form-text">填写 API 根地址或完整的 /chat/completions 地址。</div>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="aiTextModel">模型名称</label>
+                  <input class="form-control" id="aiTextModel" placeholder="gpt-5-mini">
+                  <div class="form-text">推荐选支持非流式 JSON 输出的模型；推理模型需确保会输出最终 content。</div>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="aiTextApiKey">API Key</label>
+                  <div class="input-group">
+                    <input type="password" class="form-control" id="aiTextApiKey" autocomplete="new-password" readonly>
+                    <button class="btn btn-outline-primary" id="aiTextApiKeyEditButton" type="button" onclick="enableAIModelSecretEdit('text')">设置</button>
+                  </div>
+                  <div class="form-text" id="aiTextApiKeyState">尚未配置</div>
+                </div>
+                <button class="btn btn-outline-primary" type="button" onclick="testAIModel('text')">
+                  <i class="bi bi-plug me-1"></i>保存并测试文案
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-xl-4 d-flex">
+            <div class="card flex-fill border-primary">
+              <div class="card-header"><i class="bi bi-eye me-2"></i>2. 视觉识图模型</div>
+              <div class="card-body">
+                <div class="mb-3">
+                  <label class="form-label" for="aiVisionBaseUrl">API 地址</label>
+                  <input class="form-control" id="aiVisionBaseUrl" placeholder="https://yunwu.ai/v1">
+                  <div class="form-text">云雾选择“创建聊天识图（非流）”，地址填 https://yunwu.ai/v1。</div>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="aiVisionModel">模型名称</label>
+                  <input class="form-control" id="aiVisionModel" placeholder="gpt-4o">
+                  <div class="form-text">必须是支持 image_url 图片输入的模型，例如供应商提供的 gpt-4o。</div>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="aiVisionApiKey">API Key</label>
+                  <div class="input-group">
+                    <input type="password" class="form-control" id="aiVisionApiKey" autocomplete="new-password" readonly>
+                    <button class="btn btn-outline-primary" id="aiVisionApiKeyEditButton" type="button" onclick="enableAIModelSecretEdit('vision')">设置</button>
+                  </div>
+                  <div class="form-text" id="aiVisionApiKeyState">留空时复用文案 Key</div>
+                </div>
+                <button class="btn btn-outline-primary" type="button" onclick="testAIModel('vision')">
+                  <i class="bi bi-image me-1"></i>保存并测试识图
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-xl-4 d-flex">
+            <div class="card flex-fill">
+              <div class="card-header"><i class="bi bi-palette me-2"></i>3. 生图模型</div>
+              <div class="card-body">
+                <div class="mb-3">
+                  <label class="form-label" for="aiImageBaseUrl">API 地址</label>
+                  <input class="form-control" id="aiImageBaseUrl" placeholder="https://api.openai.com/v1">
+                  <div class="form-text">填写图像生成 API 根地址或完整的 /images/generations 地址。</div>
+                </div>
+                <div class="row g-2 mb-3">
+                  <div class="col-md-7">
+                    <label class="form-label" for="aiImageModel">模型名称</label>
+                    <input class="form-control" id="aiImageModel" placeholder="gpt-image-1">
+                  </div>
+                  <div class="col-md-5">
+                    <label class="form-label" for="aiImageSize">图片尺寸</label>
+                    <select class="form-select" id="aiImageSize">
+                      <option value="1024x1024">1024×1024</option>
+                      <option value="1024x1536">1024×1536</option>
+                      <option value="1536x1024">1536×1024</option>
+                      <option value="512x512">512×512</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="aiImageApiKey">API Key</label>
+                  <div class="input-group">
+                    <input type="password" class="form-control" id="aiImageApiKey" autocomplete="new-password" readonly>
+                    <button class="btn btn-outline-primary" id="aiImageApiKeyEditButton" type="button" onclick="enableAIModelSecretEdit('image')">设置</button>
+                  </div>
+                  <div class="form-text" id="aiImageApiKeyState">留空时复用文案 Key</div>
+                </div>
+                <button class="btn btn-outline-warning" type="button" onclick="testAIModel('image')">
+                  <i class="bi bi-stars me-1"></i>保存并测试生图（调用 1 次）
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="d-flex flex-wrap gap-2 mt-4">
+          <button class="btn btn-primary" type="button" onclick="saveAIModelSettings()">
+            <i class="bi bi-shield-lock me-1"></i>保存全部配置
+          </button>
+          <button class="btn btn-outline-secondary" type="button" onclick="loadAIModelSettings()">
+            <i class="bi bi-arrow-clockwise me-1"></i>重新读取
+          </button>
+        </div>
+        <div class="alert alert-light border mt-3 mb-0" id="aiModelSettingsStatus">尚未测试</div>
       </div>
     </div>
 

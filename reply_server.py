@@ -10262,6 +10262,9 @@ class QuarkCatalogSettingsRequest(BaseModel):
     text_base_url: Optional[str] = "https://api.openai.com/v1"
     text_api_key: Optional[str] = None
     text_model: Optional[str] = "gpt-5-mini"
+    vision_base_url: Optional[str] = "https://api.openai.com/v1"
+    vision_api_key: Optional[str] = None
+    vision_model: Optional[str] = "gpt-4o"
     image_base_url: Optional[str] = "https://api.openai.com/v1"
     image_api_key: Optional[str] = None
     image_model: Optional[str] = "gpt-image-1"
@@ -10280,6 +10283,19 @@ class QuarkCatalogSettingsRequest(BaseModel):
     schedule_enabled: Optional[bool] = False
     run_hour: Optional[int] = 8
     random_delay_max: Optional[int] = 10
+
+
+class AIModelSettingsRequest(BaseModel):
+    text_base_url: Optional[str] = "https://api.openai.com/v1"
+    text_api_key: Optional[str] = None
+    text_model: Optional[str] = "gpt-5-mini"
+    vision_base_url: Optional[str] = "https://api.openai.com/v1"
+    vision_api_key: Optional[str] = None
+    vision_model: Optional[str] = "gpt-4o"
+    image_base_url: Optional[str] = "https://api.openai.com/v1"
+    image_api_key: Optional[str] = None
+    image_model: Optional[str] = "gpt-image-1"
+    image_size: Optional[str] = "1024x1024"
 
 
 class QuarkCatalogSyncRequest(BaseModel):
@@ -10974,6 +10990,58 @@ async def _run_product_batch_publish(batch_id: str, jobs: List[Dict[str, Any]], 
 QUARK_CATALOG_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
+def _ai_model_defaults() -> Dict[str, Any]:
+    return {
+        'text_base_url': 'https://api.openai.com/v1',
+        'text_model': 'gpt-5-mini',
+        'vision_base_url': 'https://api.openai.com/v1',
+        'vision_model': 'gpt-4o',
+        'image_base_url': 'https://api.openai.com/v1',
+        'image_model': 'gpt-image-1',
+        'image_size': '1024x1024',
+    }
+
+
+def _normalize_ai_model_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _ai_model_defaults()
+    normalized.update(settings or {})
+    for field in (
+        'text_base_url', 'text_api_key', 'text_model',
+        'vision_base_url', 'vision_api_key', 'vision_model',
+        'image_base_url', 'image_api_key', 'image_model', 'image_size',
+    ):
+        normalized[field] = str(normalized.get(field) or '').strip()
+    if not normalized['vision_base_url']:
+        normalized['vision_base_url'] = normalized['text_base_url']
+    if not normalized['vision_api_key']:
+        normalized['vision_api_key'] = normalized['text_api_key']
+    if not normalized['vision_model']:
+        normalized['vision_model'] = normalized['text_model']
+    if not normalized['image_base_url']:
+        normalized['image_base_url'] = normalized['text_base_url']
+    if not normalized['image_api_key']:
+        normalized['image_api_key'] = normalized['text_api_key']
+    if normalized['image_size'] not in {'256x256', '512x512', '1024x1024', '1024x1536', '1536x1024'}:
+        normalized['image_size'] = '1024x1024'
+    return normalized
+
+
+def _masked_ai_model_settings(user_id: int) -> Dict[str, Any]:
+    masked = {
+        **_ai_model_defaults(),
+        **db_manager.get_quark_catalog_settings(user_id, include_secrets=False),
+    }
+    raw = db_manager.get_quark_catalog_settings(user_id, include_secrets=True)
+    text_ready = bool(str(raw.get('text_api_key') or '').strip())
+    for kind in ('vision', 'image'):
+        own_ready = bool(str(raw.get(f'{kind}_api_key') or '').strip())
+        masked[f'{kind}_api_key_configured'] = own_ready or text_ready
+        masked[f'{kind}_api_key_inherits_text'] = bool(not own_ready and text_ready)
+        if not masked.get(f'{kind}_base_url'):
+            masked[f'{kind}_base_url'] = masked.get('text_base_url') or _ai_model_defaults()['text_base_url']
+    return masked
+
+
 def _quark_catalog_defaults() -> Dict[str, Any]:
     return {
         'account_id': '',
@@ -10982,6 +11050,8 @@ def _quark_catalog_defaults() -> Dict[str, Any]:
         'catalog_scope': 'child_folders',
         'text_base_url': 'https://api.openai.com/v1',
         'text_model': 'gpt-5-mini',
+        'vision_base_url': 'https://api.openai.com/v1',
+        'vision_model': 'gpt-4o',
         'image_base_url': 'https://api.openai.com/v1',
         'image_model': 'gpt-image-1',
         'image_size': '1024x1024',
@@ -11015,13 +11085,19 @@ def _normalize_quark_catalog_settings(settings: Dict[str, Any]) -> Dict[str, Any
         normalized['catalog_scope'] = 'child_folders'
     if normalized['catalog_scope'] == 'selected_folder' and normalized['root_fid'] == '0':
         raise HTTPException(status_code=400, detail='“所选目录作为一个商品”不能选择夸克网盘根目录')
-    for field in ('quark_cookie', 'text_api_key', 'image_api_key', 'text_base_url',
-                  'text_model', 'image_base_url', 'image_model', 'image_size', 'category_hint',
+    for field in ('quark_cookie', 'text_api_key', 'vision_api_key', 'image_api_key', 'text_base_url',
+                  'text_model', 'vision_base_url', 'vision_model', 'image_base_url', 'image_model', 'image_size', 'category_hint',
                   'copy_background', 'pricing_strategy'):
         normalized[field] = str(normalized.get(field) or '').strip()
     normalized['copy_background'] = normalized['copy_background'][:500]
     if not normalized['image_api_key']:
         normalized['image_api_key'] = normalized['text_api_key']
+    if not normalized['vision_api_key']:
+        normalized['vision_api_key'] = normalized['text_api_key']
+    if not normalized['vision_base_url']:
+        normalized['vision_base_url'] = normalized['text_base_url']
+    if not normalized['vision_model']:
+        normalized['vision_model'] = normalized['text_model']
     if not normalized['image_base_url']:
         normalized['image_base_url'] = normalized['text_base_url']
     normalized['title_max_chars'] = max(12, min(int(normalized.get('title_max_chars') or 30), 60))
@@ -11079,7 +11155,7 @@ def _validate_ai_product_creator_ready(settings: Dict[str, Any]) -> None:
     if missing:
         raise HTTPException(
             status_code=400,
-            detail=f"请先在“夸克网盘 AI 自动上架”中保存：{'、'.join(missing)}",
+            detail=f"请先在“AI 模型配置”中保存：{'、'.join(missing)}",
         )
 
 
@@ -11301,6 +11377,8 @@ async def _execute_quark_catalog_sync(
             text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'],
             text_model=settings['text_model'], image_base_url=settings['image_base_url'],
             image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            vision_base_url=settings['vision_base_url'], vision_api_key=settings['vision_api_key'],
+            vision_model=settings['vision_model'],
             image_size=settings['image_size'],
         ) as ai_client:
             market_disabled_reason = ''
@@ -11622,6 +11700,128 @@ async def _run_quark_catalog_job(
         logger.error(f"{get_user_log_prefix(current_user)} 夸克目录任务失败: {mask_sensitive_text(detail)}")
 
 
+@app.get('/ai-model-settings')
+def get_ai_model_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
+    return {'success': True, 'settings': _masked_ai_model_settings(current_user['user_id'])}
+
+
+@app.put('/ai-model-settings')
+def save_ai_model_settings(
+    request: AIModelSettingsRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    payload = _model_to_dict(request, exclude_unset=True)
+    for field in ('text_base_url', 'text_model', 'vision_base_url', 'vision_model',
+                  'image_base_url', 'image_model', 'image_size'):
+        if field in payload:
+            payload[field] = str(payload.get(field) or '').strip()
+    required = {
+        'text_base_url': '文案 API 地址', 'text_model': '文案模型',
+        'vision_base_url': '识图 API 地址', 'vision_model': '识图模型',
+        'image_base_url': '生图 API 地址', 'image_model': '生图模型',
+    }
+    existing = db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+    candidate = _normalize_ai_model_settings({**existing, **{
+        key: value for key, value in payload.items()
+        if key not in {'text_api_key', 'vision_api_key', 'image_api_key'} or str(value or '').strip()
+    }})
+    missing = [label for key, label in required.items() if not str(candidate.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"请补充：{'、'.join(missing)}")
+    if not db_manager.save_quark_catalog_settings(current_user['user_id'], payload):
+        raise HTTPException(status_code=500, detail='AI 模型配置保存失败')
+    return {
+        'success': True,
+        'message': '通用 AI 模型配置已加密保存',
+        'settings': _masked_ai_model_settings(current_user['user_id']),
+    }
+
+
+def _load_ai_model_settings_for_test(user_id: int) -> Dict[str, Any]:
+    return _normalize_ai_model_settings(
+        db_manager.get_quark_catalog_settings(user_id, include_secrets=True)
+    )
+
+
+@app.post('/ai-model-settings/test-text')
+async def test_ai_text_model(current_user: Dict[str, Any] = Depends(get_current_user)):
+    settings = _load_ai_model_settings_for_test(current_user['user_id'])
+    missing = [label for key, label in {
+        'text_base_url': '文案 API 地址', 'text_api_key': '文案 API Key', 'text_model': '文案模型',
+    }.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(missing)}")
+    try:
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'],
+            text_model=settings['text_model'], image_base_url=settings['image_base_url'],
+            image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            image_size=settings['image_size'], timeout_seconds=90,
+        ) as ai_client:
+            result = await ai_client.generate_json(
+                '你是 API 连通性检测助手，只输出 JSON。',
+                '请返回 {"ok": true, "message": "文案模型连接正常"}，不要添加其他内容。',
+                temperature=0.1, max_tokens=300,
+            )
+    except CatalogAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {'success': True, 'message': str(result.get('message') or '文案模型连接正常'), 'model': settings['text_model']}
+
+
+@app.post('/ai-model-settings/test-vision')
+async def test_ai_vision_model(current_user: Dict[str, Any] = Depends(get_current_user)):
+    settings = _load_ai_model_settings_for_test(current_user['user_id'])
+    missing = [label for key, label in {
+        'vision_base_url': '识图 API 地址', 'vision_api_key': '识图 API Key', 'vision_model': '识图模型',
+    }.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(missing)}")
+    test_png = (
+        'data:image/png;base64,'
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nxoAAAAASUVORK5CYII='
+    )
+    try:
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'],
+            text_model=settings['text_model'], vision_base_url=settings['vision_base_url'],
+            vision_api_key=settings['vision_api_key'], vision_model=settings['vision_model'],
+            image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'],
+            image_model=settings['image_model'], image_size=settings['image_size'], timeout_seconds=90,
+        ) as ai_client:
+            result = await ai_client.generate_json_with_images(
+                '你是视觉 API 连通性检测助手，只输出 JSON。',
+                '查看测试图片并返回 {"ok": true, "message": "识图模型连接正常"}。',
+                [test_png], temperature=0.1, max_tokens=300,
+            )
+    except CatalogAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {'success': True, 'message': str(result.get('message') or '识图模型连接正常'), 'model': settings['vision_model']}
+
+
+@app.post('/ai-model-settings/test-image')
+async def test_ai_image_model(current_user: Dict[str, Any] = Depends(get_current_user)):
+    settings = _load_ai_model_settings_for_test(current_user['user_id'])
+    missing = [label for key, label in {
+        'image_base_url': '生图 API 地址', 'image_api_key': '生图 API Key', 'image_model': '生图模型',
+    }.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(missing)}")
+    try:
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'],
+            text_model=settings['text_model'], image_base_url=settings['image_base_url'],
+            image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            image_size=settings['image_size'], timeout_seconds=180,
+        ) as ai_client:
+            image = await ai_client.generate_cover('极简浅色背景上的绿色圆点，方形测试图，无文字，无品牌标志。')
+    except CatalogAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        'success': True, 'message': '生图模型连接正常', 'model': settings['image_model'],
+        'width': image.get('width'), 'height': image.get('height'),
+    }
+
+
 @app.get('/quark-catalog/settings')
 def get_quark_catalog_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
     stored = db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=False)
@@ -11639,7 +11839,7 @@ def save_quark_catalog_settings(
     existing = db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
     candidate = dict(existing)
     for key, value in payload.items():
-        if key in {'quark_cookie', 'text_api_key', 'image_api_key'} and not str(value or '').strip():
+        if key in {'quark_cookie', 'text_api_key', 'vision_api_key', 'image_api_key'} and not str(value or '').strip():
             continue
         candidate[key] = value
     candidate = _normalize_quark_catalog_settings(candidate)
@@ -11828,6 +12028,9 @@ async def regenerate_quark_catalog_cover(
             text_base_url=settings['text_base_url'],
             text_api_key=settings['text_api_key'],
             text_model=settings['text_model'],
+            vision_base_url=settings['vision_base_url'],
+            vision_api_key=settings['vision_api_key'],
+            vision_model=settings['vision_model'],
             image_base_url=settings['image_base_url'],
             image_api_key=settings['image_api_key'],
             image_model=settings['image_model'],
@@ -12079,6 +12282,9 @@ async def generate_ai_product_material(
             text_base_url=settings['text_base_url'],
             text_api_key=settings['text_api_key'],
             text_model=settings['text_model'],
+            vision_base_url=settings['vision_base_url'],
+            vision_api_key=settings['vision_api_key'],
+            vision_model=settings['vision_model'],
             image_base_url=settings['image_base_url'],
             image_api_key=settings['image_api_key'],
             image_model=settings['image_model'],
@@ -12921,6 +13127,7 @@ async def generate_ip_visual_asset(profile_id: int, request: IPVisualAssetGenera
     try:
         async with CatalogAIClient(
             text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            vision_base_url=settings['vision_base_url'], vision_api_key=settings['vision_api_key'], vision_model=settings['vision_model'],
             image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
             image_size=settings['image_size'], timeout_seconds=180,
         ) as ai_client:
@@ -13103,10 +13310,13 @@ async def analyze_ip_content_source(request: IPProjectAnalyzeRequest, current_us
         )
         async with CatalogAIClient(
             text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            vision_base_url=settings['vision_base_url'], vision_api_key=settings['vision_api_key'], vision_model=settings['vision_model'],
             image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
             image_size=settings['image_size'], timeout_seconds=180,
         ) as ai_client:
-            raw_analysis = await ai_client.generate_json(system_prompt, user_prompt, temperature=0.2)
+            raw_analysis = await ai_client.generate_json(
+                system_prompt, user_prompt, temperature=0.2, max_tokens=5000
+            )
         analysis = normalize_analysis(raw_analysis, deterministic_clean)
         db_manager.update_ip_content_project(project_id, user_id, {
             'analysis': analysis,
@@ -13168,10 +13378,17 @@ async def generate_ip_content_project(project_id: int, request: IPProjectGenerat
         )
         async with CatalogAIClient(
             text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            vision_base_url=settings['vision_base_url'], vision_api_key=settings['vision_api_key'], vision_model=settings['vision_model'],
             image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
             image_size=settings['image_size'], timeout_seconds=240,
         ) as ai_client:
-            raw_generation = await ai_client.generate_json(system_prompt, user_prompt, temperature=0.62)
+            # Reasoning-capable gateways may consume several thousand tokens
+            # before emitting the final structured article.  Reserve enough
+            # output budget so ``content`` is not left empty after the thought
+            # trace fills a small provider default.
+            raw_generation = await ai_client.generate_json(
+                system_prompt, user_prompt, temperature=0.62, max_tokens=12000
+            )
             generated = normalize_generation(raw_generation, platforms)
             if len(generated.get('master_markdown') or '') < 300:
                 raise CatalogAIError('母稿内容过短，请补充来源内容或创作方向后重试')
@@ -13234,7 +13451,7 @@ async def generate_ip_content_project(project_id: int, request: IPProjectGenerat
                         )
                     except Exception as exc:
                         visual_warnings.append(
-                            f"当前文案模型未完成来源图片识别，已使用保守初选，工作台可逐图修改：{mask_sensitive_text(exc)}"
+                            f"当前视觉识图模型未完成来源图片识别，已使用保守初选，工作台可逐图修改：{mask_sensitive_text(exc)}"
                         )
                 else:
                     visual_warnings.append('部分来源图缺少本地图片内容，已使用保守初选')
@@ -13431,6 +13648,7 @@ async def regenerate_ip_visual(project_id: int, visual_id: str, request: IPVisua
     try:
         async with CatalogAIClient(
             text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            vision_base_url=settings['vision_base_url'], vision_api_key=settings['vision_api_key'], vision_model=settings['vision_model'],
             image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
             image_size=settings['image_size'], timeout_seconds=180,
         ) as ai_client:
