@@ -49,6 +49,9 @@ if [ -n "$old_watchdog" ] && kill -0 "$old_watchdog" 2>/dev/null; then
         *integrity_watchdog.sh*"$PROJECT_DIR"*) kill -TERM "$old_watchdog" 2>/dev/null || true ;;
     esac
 fi
+if command -v screen >/dev/null 2>&1; then
+    screen -S xianyu-watchdog -X quit >/dev/null 2>&1 || true
+fi
 
 echo "正在启动..."
 if command -v screen >/dev/null 2>&1; then
@@ -69,9 +72,18 @@ for attempt in $(seq 1 60); do
         listening_pid="$(lsof -tiTCP:8090 -sTCP:LISTEN 2>/dev/null | head -n 1)"
         printf '%s\n' "$listening_pid" > "$PROJECT_DIR/.server.pid"
         printf '%s\n' "$listening_pid" > "$RECOVERY_ROOT/server.pid"
-        nohup /bin/bash "$PROJECT_DIR/scripts/integrity_watchdog.sh" "$PROJECT_DIR" "$RECOVERY_ROOT" \
-            >> "$RECOVERY_ROOT/watchdog.log" 2>&1 < /dev/null &
-        printf '%s\n' "$!" > "$RECOVERY_ROOT/watchdog.pid"
+        if command -v screen >/dev/null 2>&1; then
+            screen -S xianyu-watchdog -X quit >/dev/null 2>&1 || true
+            screen -dmS xianyu-watchdog /bin/zsh -lc \
+                "exec /bin/bash '$PROJECT_DIR/scripts/integrity_watchdog.sh' '$PROJECT_DIR' '$RECOVERY_ROOT' >> '$RECOVERY_ROOT/watchdog.log' 2>&1"
+            sleep 0.2
+            watchdog_pid="$(pgrep -f "integrity_watchdog.sh $PROJECT_DIR $RECOVERY_ROOT" | tail -n 1 || true)"
+        else
+            nohup /bin/bash "$PROJECT_DIR/scripts/integrity_watchdog.sh" "$PROJECT_DIR" "$RECOVERY_ROOT" \
+                >> "$RECOVERY_ROOT/watchdog.log" 2>&1 < /dev/null &
+            watchdog_pid="$!"
+        fi
+        printf '%s\n' "$watchdog_pid" > "$RECOVERY_ROOT/watchdog.pid"
         echo "========================================"
         echo "  启动成功"
         echo "  Web管理界面: http://localhost:8090"

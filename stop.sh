@@ -41,6 +41,7 @@ done
 
 if command -v screen >/dev/null 2>&1; then
     screen -S xianyu8090 -X quit >/dev/null 2>&1 || true
+    screen -S xianyu-watchdog -X quit >/dev/null 2>&1 || true
 fi
 
 : > "$PROJECT_DIR/.server.pid"

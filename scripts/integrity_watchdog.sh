@@ -15,12 +15,17 @@ ESSENTIAL=(
 
 while true; do
     healthy=1
-    [ -f "$SENTINEL" ] || healthy=0
+    grep -qx 'xianyu-auto-reply:w636:protected-root:v1' "$SENTINEL" 2>/dev/null || healthy=0
     [ -s "$DATABASE" ] || healthy=0
     for path in "${ESSENTIAL[@]}"; do
         [ -f "$path" ] || healthy=0
     done
-    source_count="$(find "$PROJECT_DIR" -type f -not -path '*/.git/*' 2>/dev/null | wc -l | tr -d ' ')"
+    source_count="$(find "$PROJECT_DIR" -type f \
+        -not -path '*/.git/*' \
+        -not -path '*/venv/*' \
+        -not -path '*/data/*' \
+        -not -path '*/logs/*' \
+        -not -name '*.log' 2>/dev/null | wc -l | tr -d ' ')"
     [ "${source_count:-0}" -ge 80 ] || healthy=0
 
     if [ "$healthy" -ne 1 ]; then
@@ -35,6 +40,10 @@ while true; do
             screen -S xianyu8090 -X quit >/dev/null 2>&1 || true
         fi
         exit 80
+    fi
+    if [ "${XIANYU_WATCHDOG_ONCE:-0}" = "1" ]; then
+        printf '完整性看守单次检查通过: source_files=%s\n' "$source_count"
+        exit 0
     fi
     sleep 5
 done
