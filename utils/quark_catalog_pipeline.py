@@ -810,6 +810,66 @@ class CatalogAIClient:
         except Exception as exc:
             raise CatalogAIError(f"文案模型返回格式异常: {response.text[:800]}") from exc
 
+    async def generate_json_with_images(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_urls: Optional[List[str]] = None,
+        *,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call a vision-capable OpenAI-compatible chat endpoint for JSON.
+
+        Unlike :meth:`generate_json`, this method intentionally does not retry a
+        rejected multimodal request as text-only.  Callers use that distinction
+        to fall back to deterministic image-review rules instead of pretending
+        that a text-only model inspected the pixels.
+        """
+        if not self.text_model:
+            raise CatalogAIError("文案模型不能为空")
+        clean_images = [str(item or "").strip() for item in (image_urls or []) if str(item or "").strip()]
+        if not clean_images:
+            return await self.generate_json(
+                system_prompt, user_prompt, temperature=temperature, max_tokens=max_tokens
+            )
+        endpoint = self._api_endpoint(self.text_base_url, "chat/completions")
+        headers = self._auth_headers(self.text_api_key)
+        content: List[Dict[str, Any]] = [{"type": "text", "text": str(user_prompt or "")}]
+        content.extend({
+            "type": "image_url",
+            "image_url": {"url": image_url, "detail": "low"},
+        } for image_url in clean_images[:12])
+        payload: Dict[str, Any] = {
+            "model": self.text_model,
+            "temperature": float(temperature),
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": str(system_prompt or "")},
+                {"role": "user", "content": content},
+            ],
+        }
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+        response = await self._client.post(endpoint, headers=headers, json=payload)
+        if response.status_code in {400, 422} and any(
+            marker in response.text.lower()
+            for marker in ("response_format", "temperature", "max_tokens", "unsupported parameter")
+        ):
+            payload.pop("response_format", None)
+            payload.pop("temperature", None)
+            payload.pop("max_tokens", None)
+            response = await self._client.post(endpoint, headers=headers, json=payload)
+        if response.is_error:
+            raise CatalogAIError(
+                f"来源图片识别未完成: HTTP {response.status_code} {response.text[:500]}"
+            )
+        try:
+            api_payload = response.json()
+            return parse_json_object(api_payload["choices"][0]["message"]["content"])
+        except Exception as exc:
+            raise CatalogAIError(f"来源图片识别返回格式异常: {response.text[:800]}") from exc
+
     async def generate_listing(
         self,
         folder: QuarkEntry,

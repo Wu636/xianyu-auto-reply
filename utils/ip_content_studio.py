@@ -34,6 +34,19 @@ PLATFORM_LABELS = {
     "x": "X 线程",
 }
 
+SOURCE_IMAGE_STRATEGIES = {
+    "smart_mix": "智能混合（推荐）",
+    "ip_original": "全部使用原创 IP 配图",
+    "necessary_original": "仅保留必要原图",
+    "keep_all": "保留全部原图（自有或已获许可）",
+}
+
+SOURCE_IMAGE_MODES = {"use_original", "redraw", "omit"}
+SOURCE_IMAGE_CLASSIFICATIONS = {
+    "evidence", "interface", "steps", "data", "comparison",
+    "concept", "promotion", "portrait", "decorative", "sensitive", "unknown",
+}
+
 _UI_NOISE_PATTERNS = (
     r"^(回复|转发|喜欢|书签|分享|显示此线程|查看更多|阅读原文)$",
     r"^(reply|repost|like|bookmark|share|show this thread)$",
@@ -248,6 +261,7 @@ def normalize_analysis(payload: Dict[str, Any], deterministic_clean: Dict[str, A
 def build_generation_prompts(
     *, profile: Dict[str, Any], analysis: Dict[str, Any], angle: str,
     custom_direction: str, platforms: Iterable[str], source_title: str,
+    image_strategy: str = "smart_mix",
 ) -> Tuple[str, str]:
     selected = [item for item in platforms if item in PLATFORM_LABELS] or ["wechat"]
     platform_names = [PLATFORM_LABELS[item] for item in selected]
@@ -258,7 +272,7 @@ def build_generation_prompts(
 3. 目标IP的第一人称经历只可来自“可核验经历”。没有对应经历时使用“最近我学习/整理/观察到”，不得编造亲身实践、收入、客户案例或购买经历。
 4. 事实不确定时列入 confirmation_items，不要伪装为确定事实。
 5. 母稿适合公众号直接编辑发布：标题清楚，开头自然，段落短，H2/H3层级、加粗、列表、引用合理，拒绝空话和AI腔。
-6. 配图只生成新图方案，不复制来源图片；角色、品牌色和视觉风格保持一致。
+6. 生成的原创配图必须保持角色、品牌色和视觉风格一致。来源截图由独立审核流程决定是否引用，visual_plan 只规划原创 IP 配图，不要把来源图片伪装成新图。
 7. 小红书、抖音、X不是截断母稿，而是重新适配各平台阅读方式。
 只输出严格JSON，字段：title_candidates（3个）、title、summary、master_markdown、confirmation_items、fact_notes、variants、visual_plan。
 variants对象可含：wechat{title,summary,markdown}；xiaohongshu{title,body,tags,card_copy}；douyin{hook,voiceover,storyboard,subtitle_lines,cover_text}；x{posts}。
@@ -271,6 +285,7 @@ visual_plan为数组，每项含slot（cover/section/quote/flow）、section_tit
 选定创作角度：{ANGLE_LABELS.get(angle, angle or ANGLE_LABELS['recent_learning'])}
 补充方向：{custom_direction or '无'}
 目标平台：{', '.join(platform_names)}
+配图策略：{SOURCE_IMAGE_STRATEGIES.get(image_strategy, SOURCE_IMAGE_STRATEGIES['smart_mix'])}
 
 目标IP档案（所有第一人称信息以此为真值边界）：
 {profile_prompt(profile)}
@@ -280,6 +295,198 @@ visual_plan为数组，每项含slot（cover/section/quote/flow）、section_tit
 
 生成一篇完整、有个人判断、可直接编辑发布的公众号母稿，并给出所选平台变体。母稿首段使用目标IP的自然自我介绍；不要提及原作者，也不要假装原知识是目标IP原创发现。可使用“最近学习到/看到一个观点后，我重新想了想”等诚实引入。"""
     return system, user
+
+
+def markdown_headings(markdown_text: str) -> List[str]:
+    headings: List[str] = []
+    for raw in str(markdown_text or "").splitlines():
+        match = re.match(r"^#{2,3}\s+(.+?)\s*$", raw.strip())
+        if match:
+            value = re.sub(r"[*_`]+", "", match.group(1)).strip()
+            if value and value not in headings:
+                headings.append(value)
+    return headings
+
+
+def build_source_image_review_prompts(
+    *, source_title: str, source_url: str, master_markdown: str,
+    source_images: List[Dict[str, Any]], image_strategy: str,
+) -> Tuple[str, str]:
+    """Build a vision-review prompt without exposing source-image bytes in text."""
+    headings = markdown_headings(master_markdown)
+    metadata = []
+    for index, image in enumerate(source_images[:12], start=1):
+        metadata.append({
+            "index": index,
+            "filename": str(image.get("filename") or image.get("name") or f"source-{index}"),
+            "alt": str(image.get("alt") or ""),
+            "width": image.get("width"),
+            "height": image.get("height"),
+            "source_url": str(image.get("source_url") or ""),
+        })
+    system = """你是内容编辑部的图片审核员。逐张检查随消息提供的来源图片，判断它在一篇二创文章里的信息价值和风险。
+优先保留：软件界面、步骤、参数、数据、前后对比等去掉后会损失关键信息的图片。
+优先重绘：概念示意、流程结构、只负责解释气氛的图片。
+优先排除：作者自拍/头像、课程与商品宣传、二维码、联系方式、收入或粉丝炫耀、纯装饰、明显隐私与密钥。
+不要根据文件名猜测未看到的内容。输出严格JSON对象，字段 images；images 每项字段：index、classification、recommended_mode、reason、insert_after_heading、caption、sensitive_notes。
+classification 仅可用 evidence/interface/steps/data/comparison/concept/promotion/portrait/decorative/sensitive/unknown；recommended_mode 仅可用 use_original/redraw/omit。
+insert_after_heading 必须从给定母稿小标题中原样选择，找不到合适位置则留空。caption 是客观简短的中文图片说明，不冒充原作者结论。"""
+    user = f"""来源主题：{source_title or '未命名来源'}
+来源链接：{source_url or '未提供'}
+本次策略：{SOURCE_IMAGE_STRATEGIES.get(image_strategy, SOURCE_IMAGE_STRATEGIES['smart_mix'])}
+母稿小标题：{json.dumps(headings, ensure_ascii=False)}
+图片元数据（顺序与后附图片一致）：
+{json.dumps(metadata, ensure_ascii=False, indent=2)}
+
+请逐张给出审核建议。保留原图时也要指出应裁剪、遮挡或去除的敏感区域。"""
+    return system, user
+
+
+def _fallback_source_modes(
+    source_images: List[Dict[str, Any]], image_strategy: str,
+) -> Dict[int, str]:
+    if image_strategy == "ip_original":
+        return {index: "omit" for index in range(1, len(source_images) + 1)}
+    if image_strategy == "keep_all":
+        return {index: "use_original" for index in range(1, len(source_images) + 1)}
+
+    preferred: List[int] = []
+    secondary: List[int] = []
+    for index, image in enumerate(source_images, start=1):
+        width = float(image.get("width") or 0)
+        height = float(image.get("height") or 0)
+        ratio = width / height if width > 0 and height > 0 else 1.0
+        # Very wide banners, tiny thumbnails and portrait video covers are less
+        # likely to be indispensable explanatory screenshots.
+        if width >= 700 and height >= 450 and 0.78 <= ratio <= 2.05:
+            preferred.append(index)
+        else:
+            secondary.append(index)
+    limit = 2 if image_strategy == "necessary_original" else 3
+    selected = (preferred + secondary)[:limit]
+    return {
+        index: ("use_original" if index in selected else "redraw")
+        for index in range(1, len(source_images) + 1)
+    }
+
+
+def normalize_source_image_review(
+    payload: Optional[Dict[str, Any]], source_images: List[Dict[str, Any]],
+    master_markdown: str, image_strategy: str,
+) -> List[Dict[str, Any]]:
+    """Normalize AI/fallback source-image decisions into auditable records."""
+    strategy = image_strategy if image_strategy in SOURCE_IMAGE_STRATEGIES else "smart_mix"
+    headings = markdown_headings(master_markdown)
+    raw_items = (payload or {}).get("images") if isinstance(payload, dict) else []
+    raw_by_index: Dict[int, Dict[str, Any]] = {}
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= index <= len(source_images):
+                raw_by_index[index] = item
+    fallback_modes = _fallback_source_modes(source_images, strategy)
+    reviewed: List[Dict[str, Any]] = []
+    used_count = 0
+    max_originals = 3 if strategy == "smart_mix" else (2 if strategy == "necessary_original" else len(source_images))
+    for index, image in enumerate(source_images[:12], start=1):
+        raw = raw_by_index.get(index) or {}
+        classification = str(raw.get("classification") or "unknown").strip().lower()
+        if classification not in SOURCE_IMAGE_CLASSIFICATIONS:
+            classification = "unknown"
+        recommended = str(raw.get("recommended_mode") or fallback_modes.get(index) or "omit").strip().lower()
+        if recommended not in SOURCE_IMAGE_MODES:
+            recommended = fallback_modes.get(index) or "omit"
+        if strategy == "ip_original":
+            recommended = "omit"
+        elif strategy == "keep_all":
+            recommended = "use_original"
+        elif classification in {"promotion", "portrait", "decorative", "sensitive"}:
+            recommended = "omit" if classification != "decorative" else "redraw"
+        elif recommended == "use_original" and used_count >= max_originals:
+            recommended = "redraw"
+        if recommended == "use_original":
+            used_count += 1
+        heading = str(raw.get("insert_after_heading") or "").strip()
+        if heading not in headings:
+            heading = headings[min(index - 1, len(headings) - 1)] if headings else ""
+        alt = str(image.get("alt") or "").strip()
+        if not alt or alt.lower() == "image":
+            alt = f"来源说明图 {index}"
+        caption = str(raw.get("caption") or "").strip() or alt
+        reviewed.append({
+            "index": index,
+            "classification": classification,
+            "recommended_mode": recommended,
+            "use_mode": recommended,
+            "reason": str(raw.get("reason") or (
+                "识图模型未给出结论，已按尺寸与顺序作保守初选" if not raw else "待人工复核"
+            )).strip(),
+            "insert_after_heading": heading,
+            "caption": caption[:300],
+            "sensitive_notes": str(raw.get("sensitive_notes") or "").strip()[:500],
+            "ai_reviewed": bool(raw),
+        })
+    return reviewed
+
+
+def save_source_visual_assets(
+    project_dir: Path, source_images: List[Dict[str, Any]], decisions: List[Dict[str, Any]],
+    *, article_source_url: str = "", source_author: str = "",
+) -> List[Dict[str, Any]]:
+    """Persist normalized source images beside generated assets for export/review."""
+    assets = Path(project_dir) / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    decision_by_index = {int(item.get("index") or 0): item for item in decisions}
+    visuals: List[Dict[str, Any]] = []
+    for index, image in enumerate(source_images[:12], start=1):
+        decision = decision_by_index.get(index) or {"index": index, "use_mode": "omit"}
+        visual: Dict[str, Any] = {
+            "id": f"source-{index}",
+            "source_kind": "source",
+            "slot": "source",
+            "source_image_index": index,
+            "source_url": str(image.get("source_url") or "")[:2000],
+            "article_source_url": str(article_source_url or "")[:2000],
+            "source_author": str(source_author or "")[:120],
+            "source_filename": str(image.get("filename") or image.get("name") or f"source-{index}.jpg")[:180],
+            "alt": str(decision.get("caption") or image.get("alt") or f"来源说明图 {index}")[:300],
+            "caption": str(decision.get("caption") or image.get("alt") or f"来源说明图 {index}")[:300],
+            "classification": str(decision.get("classification") or "unknown"),
+            "recommended_mode": str(decision.get("recommended_mode") or decision.get("use_mode") or "omit"),
+            "use_mode": str(decision.get("use_mode") or "omit"),
+            "reason": str(decision.get("reason") or "")[:600],
+            "sensitive_notes": str(decision.get("sensitive_notes") or "")[:500],
+            "insert_after_heading": str(decision.get("insert_after_heading") or "")[:300],
+            "section_title": str(decision.get("insert_after_heading") or "")[:300],
+            "ai_reviewed": bool(decision.get("ai_reviewed")),
+            "reviewed": False,
+            "width": image.get("width"),
+            "height": image.get("height"),
+        }
+        encoded = str(image.get("data") or image.get("content") or image.get("base64") or "").strip()
+        if encoded.startswith("data:"):
+            encoded = encoded.partition(",")[2]
+        try:
+            raw = base64.b64decode(re.sub(r"\s+", "", encoded), validate=False)
+            if not raw or len(raw) > 12 * 1024 * 1024:
+                raise ValueError("来源图片内容为空或超过 12MB")
+            path = assets / f"source-{index}.jpg"
+            path.write_bytes(raw)
+            visual.update({
+                "status": "ready",
+                "path": str(path),
+                "relative_path": f"assets/{path.name}",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            })
+        except Exception as exc:
+            visual.update({"status": "failed", "error": str(exc)[:300], "use_mode": "omit"})
+        visuals.append(visual)
+    return visuals
 
 
 def normalize_generation(payload: Dict[str, Any], platforms: Iterable[str]) -> Dict[str, Any]:
@@ -380,17 +587,37 @@ def save_visual_asset(project_dir: Path, visual: Dict[str, Any], image: Dict[str
 
 def compose_master_with_visuals(master_markdown: str, visuals: List[Dict[str, Any]]) -> str:
     result = str(master_markdown or "").strip()
-    ready = [item for item in visuals if item.get("status") == "ready" and item.get("relative_path")]
+    ready = [
+        item for item in visuals
+        if item.get("status") == "ready"
+        and item.get("relative_path")
+        and (
+            item.get("source_kind") != "source"
+            or item.get("use_mode") == "use_original"
+        )
+        and item.get("use_mode") != "omit"
+    ]
     cover = next((item for item in ready if item.get("slot") == "cover"), None)
     if cover:
         lines = result.splitlines()
         insert_at = 1 if lines and lines[0].startswith("# ") else 0
-        lines[insert_at:insert_at] = ["", f"![{cover.get('alt') or '文章封面'}]({cover['relative_path']})", ""]
+        cover_alt = _safe_markdown_label(cover.get("alt"), "文章封面")
+        lines[insert_at:insert_at] = ["", f"![{cover_alt}]({cover['relative_path']})", ""]
         result = "\n".join(lines)
     for item in ready:
         if item is cover:
             continue
-        image_md = f"\n\n![{item.get('alt') or '文章配图'}]({item['relative_path']})\n"
+        image_alt = _safe_markdown_label(item.get("alt"), "文章配图")
+        image_md = f"\n\n![{image_alt}]({item['relative_path']})\n"
+        if item.get("source_kind") == "source":
+            caption = _safe_markdown_label(item.get("caption") or item.get("alt"), "来源截图")
+            source_author = _safe_markdown_label(item.get("source_author"), "")
+            credit = f"来源：{source_author}" if source_author else "来源：原文"
+            article_url = _safe_http_url(item.get("article_source_url"))
+            source_note = f"{caption}（{credit}）"
+            if article_url:
+                source_note += f" · [查看原文]({article_url})"
+            image_md += f"\n*{source_note}*\n"
         heading = str(item.get("insert_after_heading") or item.get("section_title") or "").strip().lstrip("# ")
         if heading:
             pattern = re.compile(rf"(^##+\s+.*{re.escape(heading)}.*$)", flags=re.MULTILINE | re.IGNORECASE)
@@ -402,10 +629,26 @@ def compose_master_with_visuals(master_markdown: str, visuals: List[Dict[str, An
     return re.sub(r"\n{4,}", "\n\n\n", result).strip() + "\n"
 
 
+def _safe_markdown_label(value: Any, fallback: str) -> str:
+    text = re.sub(r"[\r\n\[\]]+", " ", str(value or "")).strip()
+    return text[:300] or fallback
+
+
+def _safe_http_url(value: Any) -> str:
+    url = str(value or "").strip()
+    return url if re.match(r"^https?://[^\s]+$", url, flags=re.IGNORECASE) else ""
+
+
 def _inline_html(text: str) -> str:
     escaped = html.escape(text)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
     escaped = re.sub(r"`([^`]+)`", r"<code style=\"background:#f2f4f7;padding:2px 5px;border-radius:4px\">\1</code>", escaped)
+    escaped = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        r'<a href="\2" target="_blank" rel="noopener noreferrer" style="color:#4f46e5">\1</a>',
+        escaped,
+    )
+    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
     return escaped
 
 
@@ -503,14 +746,36 @@ def write_project_package(base_dir: Path, project_id: int, project: Dict[str, An
         (project_dir / f"{key}.md").write_text(_variant_markdown(key, value), encoding="utf-8")
     (project_dir / "source-analysis.json").write_text(json.dumps(project.get("analysis") or {}, ensure_ascii=False, indent=2), encoding="utf-8")
     (project_dir / "quality-report.json").write_text(json.dumps(project.get("quality") or {}, ensure_ascii=False, indent=2), encoding="utf-8")
+    source_reviews = [
+        {key: value for key, value in item.items() if key not in {"path"}}
+        for item in project.get("visuals") or [] if item.get("source_kind") == "source"
+    ]
+    (project_dir / "source-image-review.json").write_text(
+        json.dumps(source_reviews, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
     (project_dir / "ip-profile.json").write_text(json.dumps(profile, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     manifest = {
         "project_id": project_id,
         "title": title,
         "platforms": sorted(variants.keys()),
-        "original_source_images_reused": False,
-        "visual_count": len([item for item in project.get("visuals") or [] if item.get("status") == "ready"]),
-        "files": ["master.md", "article.html", "article.docx", "article.pdf", "source-analysis.json", "quality-report.json", "ip-profile.json"],
+        "original_source_images_reused": any(
+            item.get("source_kind") == "source" and item.get("use_mode") == "use_original"
+            for item in project.get("visuals") or []
+        ),
+        "source_image_count": len([
+            item for item in project.get("visuals") or []
+            if item.get("source_kind") == "source"
+        ]),
+        "source_image_used_count": len([
+            item for item in project.get("visuals") or []
+            if item.get("source_kind") == "source" and item.get("use_mode") == "use_original"
+        ]),
+        "visual_count": len([
+            item for item in project.get("visuals") or []
+            if item.get("status") == "ready"
+            and (item.get("source_kind") != "source" or item.get("use_mode") == "use_original")
+        ]),
+        "files": ["master.md", "article.html", "article.docx", "article.pdf", "source-analysis.json", "source-image-review.json", "quality-report.json", "ip-profile.json"],
     }
     (project_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     zip_path = project_dir.parent / f"ip-content-{project_id}.zip"

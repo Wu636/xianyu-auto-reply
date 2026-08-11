@@ -11719,6 +11719,12 @@ function renderIPStudioMeta() {
     if (platforms) platforms.innerHTML = (ipStudioMeta.platforms || []).map(item => `
         <div class="form-check"><input class="form-check-input ip-platform-check" type="checkbox" value="${escapeHtml(item.key)}" id="ipPlatform-${escapeHtml(item.key)}" checked><label class="form-check-label" for="ipPlatform-${escapeHtml(item.key)}">${escapeHtml(item.label)}</label></div>
     `).join('');
+    const strategy = document.getElementById('ipImageStrategy');
+    if (strategy && (ipStudioMeta.image_strategies || []).length) {
+        const current = strategy.value || 'smart_mix';
+        strategy.innerHTML = ipStudioMeta.image_strategies.map(item => `<option value="${escapeHtml(item.key)}">${escapeHtml(item.label)}</option>`).join('');
+        strategy.value = [...strategy.options].some(option => option.value === current) ? current : 'smart_mix';
+    }
 }
 
 function renderIPProfileSelect() {
@@ -12064,7 +12070,7 @@ async function loadIPSourceImport() {
         document.getElementById('ipSourceAuthor').value = item.author || '';
         document.getElementById('ipSourceText').value = item.source_text || '';
         ipSourceImages = item.images || [];
-        setIPStudioStatus(`已载入 Chrome 采集：${String(item.source_text || '').length} 字、${ipSourceImages.length} 张来源图；来源图不会直接进入发布稿。`, 'info');
+        setIPStudioStatus(`已载入 Chrome 采集：${String(item.source_text || '').length} 字、${ipSourceImages.length} 张来源图；生成时会按所选策略分析，发布前可逐张审核。`, 'info');
     } catch (error) {
         showToast(error.message || 'Chrome 采集载入失败', 'danger');
     }
@@ -12133,7 +12139,7 @@ async function generateIPProject() {
     const original = button?.innerHTML || '';
     ipStudioBusy = true;
     if (button) { button.disabled = true; button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>创作中...'; }
-    setIPStudioStatus('正在用你的 IP 档案重构文章，并生成多平台版本和新配图...', 'info');
+    setIPStudioStatus('正在用你的 IP 档案重构文章、分析来源配图，并生成多平台版本...', 'info');
     try {
         const result = await requestItemPublishJson(`/ip-content-studio/projects/${ipCurrentProject.id}/generate`, {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
@@ -12141,7 +12147,8 @@ async function generateIPProject() {
                 custom_direction: document.getElementById('ipCustomDirection')?.value.trim() || null,
                 platforms,
                 generate_images: Boolean(document.getElementById('ipGenerateImages')?.checked),
-                image_count: Number(document.getElementById('ipImageCount')?.value || 0)
+                image_count: Number(document.getElementById('ipImageCount')?.value || 0),
+                image_strategy: document.getElementById('ipImageStrategy')?.value || 'smart_mix'
             })
         });
         ipCurrentProject = result.project;
@@ -12164,6 +12171,9 @@ function renderIPProjectEditor(project) {
     document.getElementById('ipMasterTitle').value = project.title || '';
     document.getElementById('ipMasterSummary').value = project.summary || '';
     document.getElementById('ipMasterMarkdown').value = project.master_markdown || '';
+    const strategy = document.getElementById('ipImageStrategy');
+    const savedStrategy = project.brief?.image_strategy;
+    if (strategy && savedStrategy && [...strategy.options].some(option => option.value === savedStrategy)) strategy.value = savedStrategy;
     const quality = project.quality || {};
     const summary = document.getElementById('ipQualitySummary');
     if (summary) summary.innerHTML = `原创度 <strong>${Number(quality.originality_score || 0)}</strong>/100 · 全文相似度 ${Math.round(Number(quality.whole_text_similarity || 0) * 100)}% · 身份污染 ${Number((quality.source_identity_contamination || []).length)} 处 ${quality.passed ? '<span class="text-success">已通过</span>' : '<span class="text-warning">建议复核</span>'}`;
@@ -12203,13 +12213,85 @@ function revokeIPVisualUrls() {
     ipVisualObjectUrls = [];
 }
 
+function ipMarkdownHeadings(value) {
+    return String(value || '').split(/\r?\n/).map(line => {
+        const match = line.trim().match(/^#{2,3}\s+(.+?)\s*$/);
+        return match ? match[1].replace(/[*_`]+/g, '').trim() : '';
+    }).filter((value, index, values) => value && values.indexOf(value) === index);
+}
+
 function renderIPVisuals(visuals) {
     revokeIPVisualUrls();
     const gallery = document.getElementById('ipVisualGallery');
     if (!gallery) return;
-    if (!visuals.length) { gallery.innerHTML = '<div class="text-muted small">暂无配图方案</div>'; return; }
-    gallery.innerHTML = visuals.map(item => `<div class="col-sm-6 col-xl-4"><div class="card h-100"><div class="ratio ratio-1x1 bg-light rounded-top d-flex align-items-center justify-content-center overflow-hidden" id="ipVisualImage-${escapeHtml(item.id)}">${item.status === 'ready' ? '<span class="spinner-border spinner-border-sm text-primary"></span>' : `<div class="text-center p-3"><i class="bi bi-image fs-2"></i><div class="small mt-2">${escapeHtml(item.status === 'failed' ? '生图失败，提示词已保留' : '配图方案')}</div></div>`}</div><div class="card-body"><div class="fw-semibold">${escapeHtml(item.alt || item.section_title || item.slot || '配图')}</div><div class="text-muted small mt-1" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden">${escapeHtml(item.prompt || '')}</div><textarea class="form-control form-control-sm mt-2" id="ipVisualSuggestion-${escapeHtml(item.id)}" rows="2" placeholder="补充建议：更有冲击力、换成真人摄影感……"></textarea><button class="btn btn-sm btn-outline-primary w-100 mt-2" onclick="regenerateIPVisual('${escapeHtml(item.id)}')"><i class="bi bi-arrow-repeat me-1"></i>按建议重生成</button>${item.status === 'ready' ? `<button class="btn btn-sm btn-outline-warning w-100 mt-2" onclick="saveIPProjectVisualToLibrary('${escapeHtml(item.id)}')"><i class="bi bi-star me-1"></i>收藏到视觉素材库</button>` : ''}</div></div></div>`).join('');
+    if (!visuals.length) {
+        gallery.innerHTML = '<div class="text-muted small">暂无配图方案</div>';
+        const summary = document.getElementById('ipSourceVisualSummary');
+        if (summary) summary.textContent = '本项目没有来源图片';
+        document.getElementById('ipSaveSourceReviewsBtn')?.classList.add('d-none');
+        return;
+    }
+    const headings = ipMarkdownHeadings(ipCurrentProject?.master_markdown || document.getElementById('ipMasterMarkdown')?.value || '');
+    const classificationLabels = {evidence:'事实证据',interface:'界面截图',steps:'操作步骤',data:'数据图',comparison:'对比图',concept:'概念图',promotion:'宣传图',portrait:'人物/头像',decorative:'装饰图',sensitive:'敏感信息',unknown:'待判断'};
+    const sourceItems = visuals.filter(item => item.source_kind === 'source');
+    const selectedCount = sourceItems.filter(item => item.use_mode === 'use_original').length;
+    const reviewedCount = sourceItems.filter(item => item.reviewed).length;
+    const summary = document.getElementById('ipSourceVisualSummary');
+    if (summary) summary.textContent = sourceItems.length ? `来源图 ${sourceItems.length} 张 · 当前引用 ${selectedCount} 张 · 已人工审核 ${reviewedCount} 张` : '本项目没有来源图片';
+    const saveButton = document.getElementById('ipSaveSourceReviewsBtn');
+    if (saveButton) saveButton.classList.toggle('d-none', sourceItems.length === 0);
+    gallery.innerHTML = visuals.map(item => {
+        const id = escapeHtml(item.id || '');
+        const preview = item.status === 'ready'
+            ? '<span class="spinner-border spinner-border-sm text-primary"></span>'
+            : `<div class="text-center p-3"><i class="bi bi-image fs-2"></i><div class="small mt-2">${escapeHtml(item.status === 'failed' ? '图片读取失败' : '配图方案')}</div></div>`;
+        if (item.source_kind === 'source') {
+            const mode = item.use_mode || 'omit';
+            const border = mode === 'use_original' ? 'border-success' : mode === 'redraw' ? 'border-warning' : 'border-secondary-subtle';
+            const headingOptions = [''].concat(headings).map(heading => `<option value="${escapeHtml(heading)}" ${heading === (item.insert_after_heading || '') ? 'selected' : ''}>${escapeHtml(heading || '文章末尾/暂不指定')}</option>`).join('');
+            const sourceLink = /^https?:\/\//i.test(String(item.article_source_url || '')) ? String(item.article_source_url) : '';
+            return `<div class="col-sm-6 col-xl-4"><div class="card h-100 ${border}" data-source-visual-id="${id}"><div class="ratio ratio-4x3 bg-light rounded-top d-flex align-items-center justify-content-center overflow-hidden" id="ipVisualImage-${id}">${preview}</div><div class="card-body"><div class="d-flex justify-content-between gap-2 align-items-start"><div class="fw-semibold">${escapeHtml(item.caption || item.alt || '来源图')}</div><span class="badge text-bg-light">${escapeHtml(classificationLabels[item.classification] || '待判断')}</span></div><div class="text-muted small mt-2">${escapeHtml(item.reason || '等待人工复核')}</div>${item.sensitive_notes ? `<div class="alert alert-warning py-1 px-2 small mt-2 mb-0"><i class="bi bi-shield-exclamation me-1"></i>${escapeHtml(item.sensitive_notes)}</div>` : ''}<label class="form-label small mt-3 mb-1" for="ipSourceMode-${id}">发布稿处理</label><select class="form-select form-select-sm ip-source-mode" id="ipSourceMode-${id}"><option value="use_original" ${mode === 'use_original' ? 'selected' : ''}>保留原图并标注来源</option><option value="redraw" ${mode === 'redraw' ? 'selected' : ''}>改用原创 IP 图（原图不引用）</option><option value="omit" ${mode === 'omit' ? 'selected' : ''}>不使用</option></select><label class="form-label small mt-2 mb-1" for="ipSourceHeading-${id}">插入章节</label><select class="form-select form-select-sm ip-source-heading" id="ipSourceHeading-${id}">${headingOptions}</select><label class="form-label small mt-2 mb-1" for="ipSourceCaption-${id}">图片说明</label><input class="form-control form-control-sm ip-source-caption" id="ipSourceCaption-${id}" value="${escapeHtml(item.caption || item.alt || '')}" maxlength="300"><label class="form-label small mt-2 mb-1" for="ipSourceSensitive-${id}">裁剪/遮挡提醒（发布前人工处理）</label><textarea class="form-control form-control-sm ip-source-sensitive" id="ipSourceSensitive-${id}" rows="2" placeholder="例如：遮挡账号、余额、API Key">${escapeHtml(item.sensitive_notes || '')}</textarea>${sourceLink ? `<a class="btn btn-sm btn-link px-0 mt-2" href="${escapeHtml(sourceLink)}" target="_blank" rel="noopener noreferrer"><i class="bi bi-box-arrow-up-right me-1"></i>查看原文</a>` : ''}</div></div></div>`;
+        }
+        return `<div class="col-sm-6 col-xl-4"><div class="card h-100"><div class="ratio ratio-1x1 bg-light rounded-top d-flex align-items-center justify-content-center overflow-hidden" id="ipVisualImage-${id}">${preview}</div><div class="card-body"><div class="d-flex justify-content-between gap-2"><div class="fw-semibold">${escapeHtml(item.alt || item.section_title || item.slot || '配图')}</div><span class="badge text-bg-primary">原创 IP 图</span></div><div class="text-muted small mt-1" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden">${escapeHtml(item.prompt || '')}</div><textarea class="form-control form-control-sm mt-2" id="ipVisualSuggestion-${id}" rows="2" placeholder="补充建议：更有冲击力、换构图、强化角色动作……"></textarea><button class="btn btn-sm btn-outline-primary w-100 mt-2" onclick="regenerateIPVisual('${id}')"><i class="bi bi-arrow-repeat me-1"></i>按建议重生成</button>${item.status === 'ready' ? `<button class="btn btn-sm btn-outline-warning w-100 mt-2" onclick="saveIPProjectVisualToLibrary('${id}')"><i class="bi bi-star me-1"></i>收藏到视觉素材库</button>` : ''}</div></div></div>`;
+    }).join('');
     visuals.filter(item => item.status === 'ready' && item.url).forEach(loadIPVisualBlob);
+}
+
+async function saveIPSourceVisualReviews() {
+    if (!ipCurrentProject?.id || ipStudioBusy) return;
+    const cards = [...document.querySelectorAll('[data-source-visual-id]')];
+    if (!cards.length) return;
+    const items = cards.map(card => {
+        const id = card.dataset.sourceVisualId;
+        return {
+            id,
+            use_mode: document.getElementById(`ipSourceMode-${id}`)?.value || 'omit',
+            insert_after_heading: document.getElementById(`ipSourceHeading-${id}`)?.value || '',
+            caption: document.getElementById(`ipSourceCaption-${id}`)?.value.trim() || '',
+            sensitive_notes: document.getElementById(`ipSourceSensitive-${id}`)?.value.trim() || ''
+        };
+    });
+    const button = document.getElementById('ipSaveSourceReviewsBtn');
+    const original = button?.innerHTML || '';
+    ipStudioBusy = true;
+    if (button) { button.disabled = true; button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...'; }
+    setIPStudioStatus('正在保存来源图选择，并重新生成 Markdown、HTML、DOCX 和 PDF...', 'info');
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/projects/${ipCurrentProject.id}/source-images`, {
+            method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({items})
+        });
+        ipCurrentProject = result.project;
+        renderIPProjectEditor(ipCurrentProject);
+        await loadIPProjects();
+        showToast(result.message || '来源配图审核已保存', 'success');
+        setIPStudioStatus('来源配图审核已保存，所有文档已按当前选择重新导出。', 'success');
+    } catch (error) {
+        showToast(error.message || '来源配图审核保存失败', 'danger');
+        setIPStudioStatus(error.message || '来源配图审核保存失败', 'danger');
+    } finally {
+        ipStudioBusy = false;
+        if (button) { button.disabled = false; button.innerHTML = original || '<i class="bi bi-check2-square me-1"></i>保存来源图审核并重新导出'; }
+    }
 }
 
 async function loadIPVisualBlob(item) {

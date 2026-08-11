@@ -63,15 +63,20 @@ from utils.content_productizer import (
 from utils.ip_content_studio import (
     ANGLE_LABELS,
     PLATFORM_LABELS,
+    SOURCE_IMAGE_STRATEGIES,
     assess_originality,
     build_analysis_prompts,
     build_generation_prompts,
+    build_source_image_review_prompts,
     build_visual_identity_prompt,
     compose_master_with_visuals,
+    markdown_headings,
     normalize_analysis,
     normalize_generation,
+    normalize_source_image_review,
     preclean_source_text,
     remove_project_package,
+    save_source_visual_assets,
     save_visual_asset,
     write_project_package,
 )
@@ -10421,6 +10426,7 @@ class IPProjectGenerateRequest(BaseModel):
     platforms: List[str] = ["wechat", "xiaohongshu", "douyin", "x"]
     generate_images: bool = True
     image_count: int = 4
+    image_strategy: str = "smart_mix"
 
 
 class IPProjectUpdateRequest(BaseModel):
@@ -10429,6 +10435,18 @@ class IPProjectUpdateRequest(BaseModel):
     master_markdown: Optional[str] = None
     variants: Optional[Dict[str, Any]] = None
     brief: Optional[Dict[str, Any]] = None
+
+
+class IPSourceVisualReviewItem(BaseModel):
+    id: str
+    use_mode: str
+    insert_after_heading: Optional[str] = None
+    caption: Optional[str] = None
+    sensitive_notes: Optional[str] = None
+
+
+class IPSourceVisualReviewRequest(BaseModel):
+    items: List[IPSourceVisualReviewItem] = []
 
 
 class IPVisualRegenerateRequest(BaseModel):
@@ -12767,6 +12785,7 @@ def get_ip_content_studio_meta(current_user: Dict[str, Any] = Depends(get_curren
         'success': True,
         'angles': [{'key': key, 'label': label} for key, label in ANGLE_LABELS.items()],
         'platforms': [{'key': key, 'label': label} for key, label in PLATFORM_LABELS.items()],
+        'image_strategies': [{'key': key, 'label': label} for key, label in SOURCE_IMAGE_STRATEGIES.items()],
         'browser_imports': [{
             'id': item['id'], 'source_title': item.get('source_title'), 'source_url': item.get('source_url'),
             'author': item.get('author'), 'image_count': len(item.get('images') or []),
@@ -13115,11 +13134,13 @@ async def generate_ip_content_project(project_id: int, request: IPProjectGenerat
     angle = request.angle if request.angle in ANGLE_LABELS else 'recent_learning'
     platforms = [item for item in request.platforms if item in PLATFORM_LABELS] or ['wechat']
     image_count = max(0, min(int(request.image_count or 0), 8))
+    image_strategy = request.image_strategy if request.image_strategy in SOURCE_IMAGE_STRATEGIES else 'smart_mix'
     brief = {
         'stage': 'generating', 'angle': angle, 'angle_label': ANGLE_LABELS[angle],
         'custom_direction': str(request.custom_direction or '').strip(),
         'platforms': platforms, 'generate_images': bool(request.generate_images),
-        'image_count': image_count,
+        'image_count': image_count, 'image_strategy': image_strategy,
+        'image_strategy_label': SOURCE_IMAGE_STRATEGIES[image_strategy],
     }
     db_manager.update_ip_content_project(project_id, user_id, {'status': 'generating', 'brief': brief, 'error_message': None})
     settings = _normalize_quark_catalog_settings(db_manager.get_quark_catalog_settings(user_id, include_secrets=True))
@@ -13143,6 +13164,7 @@ async def generate_ip_content_project(project_id: int, request: IPProjectGenerat
             profile=profile, analysis=analysis, angle=angle,
             custom_direction=brief['custom_direction'], platforms=platforms,
             source_title=str(project.get('source_title') or ''),
+            image_strategy=image_strategy,
         )
         async with CatalogAIClient(
             text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
@@ -13190,10 +13212,57 @@ async def generate_ip_content_project(project_id: int, request: IPProjectGenerat
                         except Exception as exc:
                             visuals[index] = {**visuals[index], 'status': 'failed', 'error': mask_sensitive_text(exc)}
                             visual_warnings.append(f"{visual.get('alt') or visual.get('id')} 生图失败：{mask_sensitive_text(exc)}")
+            source_images = list(project.get('source_images') or [])[:12]
+            source_review_payload: Dict[str, Any] = {}
+            if source_images and image_strategy in {'smart_mix', 'necessary_original'}:
+                image_payloads = [
+                    str(next((image.get(key) for key in ('data', 'content', 'base64') if image.get(key)), '')).strip()
+                    for image in source_images
+                ]
+                image_payloads = [value for value in image_payloads if value]
+                if len(image_payloads) == len(source_images):
+                    review_system, review_user = build_source_image_review_prompts(
+                        source_title=str(project.get('source_title') or ''),
+                        source_url=str(project.get('source_url') or ''),
+                        master_markdown=generated['master_markdown'],
+                        source_images=source_images,
+                        image_strategy=image_strategy,
+                    )
+                    try:
+                        source_review_payload = await ai_client.generate_json_with_images(
+                            review_system, review_user, image_payloads, temperature=0.15, max_tokens=3000,
+                        )
+                    except Exception as exc:
+                        visual_warnings.append(
+                            f"当前文案模型未完成来源图片识别，已使用保守初选，工作台可逐图修改：{mask_sensitive_text(exc)}"
+                        )
+                else:
+                    visual_warnings.append('部分来源图缺少本地图片内容，已使用保守初选')
+            source_decisions = normalize_source_image_review(
+                source_review_payload, source_images, generated['master_markdown'], image_strategy,
+            )
+            source_visuals = save_source_visual_assets(
+                project_dir, source_images, source_decisions,
+                article_source_url=str(project.get('source_url') or ''),
+                source_author=str(project.get('source_author') or ''),
+            )
+            visuals.extend(source_visuals)
         quality = assess_originality(project.get('source_text') or '', generated['master_markdown'], analysis)
         quality['confirmation_items'] = generated.get('confirmation_items') or []
         quality['fact_notes'] = generated.get('fact_notes') or []
         quality['warnings'] = visual_warnings
+        quality['source_image_review'] = {
+            'strategy': image_strategy,
+            'total': len([item for item in visuals if item.get('source_kind') == 'source']),
+            'selected': len([
+                item for item in visuals
+                if item.get('source_kind') == 'source' and item.get('use_mode') == 'use_original'
+            ]),
+            'ai_reviewed': len([
+                item for item in visuals
+                if item.get('source_kind') == 'source' and item.get('ai_reviewed')
+            ]),
+        }
         status_value = 'ready' if quality.get('passed') else 'review_required'
         update_data = {
             'title': generated['title'], 'summary': generated['summary'],
@@ -13257,6 +13326,80 @@ def update_ip_content_project(project_id: int, request: IPProjectUpdateRequest, 
     paths = write_project_package(Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_content_studio' / str(user_id), project_id, latest, profile)
     db_manager.update_ip_content_project(project_id, user_id, {'package_dir': paths['directory'], 'package_zip': paths['zip']})
     return {'success': True, 'message': '修改已保存并重新导出', 'project': _ip_project_public_view(db_manager.get_ip_content_project(project_id, user_id))}
+
+
+@app.put('/ip-content-studio/projects/{project_id}/source-images')
+def review_ip_source_images(
+    project_id: int,
+    request: IPSourceVisualReviewRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = current_user['user_id']
+    project = db_manager.get_ip_content_project(project_id, user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    if not request.items:
+        raise HTTPException(status_code=400, detail='请至少提交一张来源图的审核结果')
+    headings = set(markdown_headings(project.get('master_markdown') or ''))
+    submitted = {str(item.id): item for item in request.items}
+    visuals = list(project.get('visuals') or [])
+    changed = 0
+    for index, visual in enumerate(visuals):
+        if visual.get('source_kind') != 'source':
+            continue
+        item = submitted.get(str(visual.get('id') or ''))
+        if not item:
+            continue
+        use_mode = str(item.use_mode or '').strip().lower()
+        if use_mode not in {'use_original', 'redraw', 'omit'}:
+            raise HTTPException(status_code=400, detail=f"来源图 {item.id} 的处理方式无效")
+        heading = str(item.insert_after_heading or '').strip()
+        if heading and heading not in headings:
+            raise HTTPException(status_code=400, detail=f"来源图 {item.id} 的插入章节已不在当前母稿中")
+        caption = str(item.caption or visual.get('caption') or visual.get('alt') or '来源说明图').strip()[:300]
+        sensitive_notes = str(item.sensitive_notes or '').strip()[:500]
+        visuals[index] = {
+            **visual,
+            'use_mode': use_mode,
+            'insert_after_heading': heading,
+            'section_title': heading,
+            'caption': caption,
+            'alt': caption,
+            'sensitive_notes': sensitive_notes,
+            'reviewed': True,
+        }
+        changed += 1
+    if not changed:
+        raise HTTPException(status_code=404, detail='项目中没有匹配的来源配图候选')
+    quality = dict(project.get('quality') or {})
+    quality['source_image_review'] = {
+        'strategy': (project.get('brief') or {}).get('image_strategy') or 'smart_mix',
+        'total': len([item for item in visuals if item.get('source_kind') == 'source']),
+        'selected': len([
+            item for item in visuals
+            if item.get('source_kind') == 'source' and item.get('use_mode') == 'use_original'
+        ]),
+        'reviewed': len([
+            item for item in visuals
+            if item.get('source_kind') == 'source' and item.get('reviewed')
+        ]),
+    }
+    if not db_manager.update_ip_content_project(project_id, user_id, {'visuals': visuals, 'quality': quality}):
+        raise HTTPException(status_code=500, detail='保存来源配图审核结果失败')
+    latest = db_manager.get_ip_content_project(project_id, user_id)
+    profile = db_manager.get_ip_profile(int(latest.get('profile_id') or 0), user_id) or {}
+    paths = write_project_package(
+        Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_content_studio' / str(user_id),
+        project_id, latest, profile,
+    )
+    db_manager.update_ip_content_project(
+        project_id, user_id, {'package_dir': paths['directory'], 'package_zip': paths['zip']}
+    )
+    return {
+        'success': True,
+        'message': '来源配图审核已保存，Markdown、HTML、DOCX 和 PDF 已重新导出',
+        'project': _ip_project_public_view(db_manager.get_ip_content_project(project_id, user_id)),
+    }
 
 
 @app.post('/ip-content-studio/projects/{project_id}/visuals/{visual_id}/regenerate')
