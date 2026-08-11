@@ -72,6 +72,11 @@ realtime.log
 # 数据目录
 data/
 backups/
+recovery_backups/
+.server.pid
+.integrity-baseline.json
+.secret_encryption.key
+data/.secret_encryption.key
 
 # Excel测试文件
 keywords_*.xlsx
@@ -301,6 +306,9 @@ build/
 !docs/usage.md
 !docs/faq.md
 !docs/release.md
+!docs/content-productization.md
+!docs/ip-content-studio.md
+!docs/RECOVERY.md
 
 # 临时配置文件
 *.local.yml
@@ -542,6 +550,11 @@ fix_*.py
 test_*.py
 check_*.py
 debug_*.py
+!tests/test_content_productizer.py
+!tests/test_feishu_document.py
+!tests/test_quark_catalog_pipeline.py
+!tests/test_ip_content_studio.py
+!tests/test_recovery_safety.py
 
 # 数据导出文件（避免提交用户数据）
 export_*.xlsx

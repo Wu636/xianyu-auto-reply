@@ -1084,6 +1084,7 @@ Cookie数量: {cookie_count}
             self._ensure_product_publish_tables(cursor)
             self._ensure_quark_catalog_tables(cursor)
             self._ensure_content_product_tables(cursor)
+            self._ensure_ip_content_studio_tables(cursor)
 
             # 迁移notification_templates表以支持新的模板类型
             self._migrate_notification_templates(cursor)
@@ -1364,6 +1365,162 @@ Cookie数量: {cookie_count}
         ''')
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_content_products_user_time ON content_products(user_id, created_at DESC)")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_content_products_user_status ON content_products(user_id, status, updated_at DESC)")
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS content_browser_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source_url TEXT,
+            source_title TEXT,
+            source_text TEXT NOT NULL,
+            author TEXT,
+            images_json TEXT,
+            metadata_json TEXT,
+            status TEXT NOT NULL DEFAULT 'captured',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_content_browser_imports_user_time "
+            "ON content_browser_imports(user_id, created_at DESC)"
+        )
+
+    def _ensure_ip_content_studio_tables(self, cursor):
+        """Create the independent personal-IP content studio records."""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS ip_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            display_name TEXT,
+            positioning TEXT,
+            audience TEXT,
+            topics_json TEXT,
+            tone TEXT,
+            opening_template TEXT,
+            closing_template TEXT,
+            bio TEXT,
+            experiences_json TEXT,
+            forbidden_phrases_json TEXT,
+            visual_style TEXT,
+            brand_colors_json TEXT,
+            reference_images_json TEXT,
+            platform_bios_json TEXT,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_ip_profiles_user_default "
+            "ON ip_profiles(user_id, is_default DESC, updated_at DESC)"
+        )
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS ip_content_projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            profile_id INTEGER,
+            browser_import_id INTEGER,
+            source_url TEXT,
+            source_title TEXT,
+            source_author TEXT,
+            source_text TEXT,
+            source_images_json TEXT,
+            analysis_json TEXT,
+            brief_json TEXT,
+            title TEXT,
+            summary TEXT,
+            master_markdown TEXT,
+            variants_json TEXT,
+            visuals_json TEXT,
+            quality_json TEXT,
+            package_dir TEXT,
+            package_zip TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (profile_id) REFERENCES ip_profiles(id) ON DELETE SET NULL,
+            FOREIGN KEY (browser_import_id) REFERENCES content_browser_imports(id) ON DELETE SET NULL
+        )
+        ''')
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_ip_projects_user_time "
+            "ON ip_content_projects(user_id, updated_at DESC, id DESC)"
+        )
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_ip_projects_user_status "
+            "ON ip_content_projects(user_id, status, updated_at DESC)"
+        )
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS ip_visual_kits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL UNIQUE,
+            character_name TEXT,
+            character_description TEXT,
+            signature_elements TEXT,
+            style_keywords TEXT,
+            negative_prompt TEXT,
+            cover_rules TEXT,
+            inline_rules TEXT,
+            prompt_template TEXT,
+            aspect_ratios_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (profile_id) REFERENCES ip_profiles(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_ip_visual_kits_user_profile "
+            "ON ip_visual_kits(user_id, profile_id)"
+        )
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS ip_visual_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            project_id INTEGER,
+            project_visual_id TEXT,
+            name TEXT NOT NULL,
+            asset_type TEXT NOT NULL DEFAULT 'style_reference',
+            file_path TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
+            source_type TEXT NOT NULL DEFAULT 'upload',
+            tags_json TEXT,
+            notes TEXT,
+            prompt TEXT,
+            width INTEGER,
+            height INTEGER,
+            sha256 TEXT,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (profile_id) REFERENCES ip_profiles(id) ON DELETE CASCADE,
+            FOREIGN KEY (project_id) REFERENCES ip_content_projects(id) ON DELETE SET NULL
+        )
+        ''')
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_ip_visual_assets_profile_time "
+            "ON ip_visual_assets(user_id, profile_id, updated_at DESC, id DESC)"
+        )
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_ip_visual_assets_primary "
+            "ON ip_visual_assets(user_id, profile_id, is_primary DESC)"
+        )
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
@@ -7084,6 +7241,43 @@ Cookie数量: {cookie_count}
             '夸克目录自动生成商品、分享链接和发货规则配置（加密）',
         )
 
+    def get_content_product_settings(self, user_id: int, include_secrets: bool = False) -> Dict[str, Any]:
+        """Read encrypted Chrome/Feishu/Quark export settings."""
+        setting = self.get_user_setting(user_id, 'content_product.settings')
+        if not setting or not setting.get('value'):
+            return {}
+        try:
+            config = json.loads(self._decrypt_secret(setting['value']))
+            if not isinstance(config, dict):
+                return {}
+        except Exception as exc:
+            logger.error(f"读取内容商品化配置失败: {exc}")
+            return {}
+        if include_secrets:
+            return config
+        masked = dict(config)
+        for field in ('feishu_app_secret', 'chrome_import_token'):
+            secret = str(config.get(field) or '').strip()
+            masked[f'{field}_configured'] = bool(secret)
+            masked.pop(field, None)
+        return masked
+
+    def save_content_product_settings(self, user_id: int, config: Dict[str, Any]) -> bool:
+        """Merge and encrypt content-product integration settings."""
+        existing = self.get_content_product_settings(user_id, include_secrets=True)
+        merged = dict(existing)
+        for key, value in (config or {}).items():
+            if key in {'feishu_app_secret', 'chrome_import_token'} and not str(value or '').strip():
+                continue
+            merged[key] = value
+        encrypted = self._encrypt_secret(json.dumps(merged, ensure_ascii=False, default=str))
+        return self.set_user_setting(
+            user_id,
+            'content_product.settings',
+            encrypted,
+            'Chrome 内容采集、飞书文档与夸克交付配置（加密）',
+        )
+
     @staticmethod
     def _row_to_quark_catalog_item(row, include_secrets: bool = False, decrypt_secret=None) -> Dict[str, Any]:
         metadata = {}
@@ -11876,6 +12070,593 @@ Cookie数量: {cookie_count}
             except Exception as exc:
                 self.conn.rollback()
                 logger.error(f"删除链接商品化记录失败: {exc}")
+                return False
+
+    @staticmethod
+    def _content_browser_import_row_to_dict(row) -> Dict[str, Any]:
+        columns = (
+            'id', 'user_id', 'source_url', 'source_title', 'source_text', 'author',
+            'images_json', 'metadata_json', 'status', 'created_at', 'updated_at',
+        )
+        data = dict(zip(columns, row))
+        data['images'] = DBManager._json_loads_safe(data.pop('images_json'), []) or []
+        data['metadata'] = DBManager._json_loads_safe(data.pop('metadata_json'), {}) or {}
+        return data
+
+    def add_content_browser_import(self, user_id: int, data: Dict[str, Any]) -> Optional[int]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    INSERT INTO content_browser_imports (
+                        user_id, source_url, source_title, source_text, author,
+                        images_json, metadata_json, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    int(user_id), data.get('source_url'), data.get('source_title'),
+                    data.get('source_text') or '', data.get('author'),
+                    self._json_dumps_safe(data.get('images') or []),
+                    self._json_dumps_safe(data.get('metadata') or {}),
+                    data.get('status') or 'captured',
+                ))
+                import_id = cursor.lastrowid
+                self.conn.commit()
+                return int(import_id)
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"保存 Chrome 内容采集失败: {exc}")
+                return None
+
+    def get_content_browser_import(self, import_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT id, user_id, source_url, source_title, source_text, author,
+                           images_json, metadata_json, status, created_at, updated_at
+                    FROM content_browser_imports WHERE id = ? AND user_id = ?
+                ''', (int(import_id), int(user_id)))
+                row = cursor.fetchone()
+                return self._content_browser_import_row_to_dict(row) if row else None
+            except Exception as exc:
+                logger.error(f"读取 Chrome 内容采集失败: {exc}")
+                return None
+
+    def list_content_browser_imports(self, user_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT id, user_id, source_url, source_title, source_text, author,
+                           images_json, metadata_json, status, created_at, updated_at
+                    FROM content_browser_imports WHERE user_id = ?
+                    ORDER BY created_at DESC, id DESC LIMIT ?
+                ''', (int(user_id), max(1, min(int(limit or 30), 100))))
+                return [self._content_browser_import_row_to_dict(row) for row in cursor.fetchall()]
+            except Exception as exc:
+                logger.error(f"列出 Chrome 内容采集失败: {exc}")
+                return []
+
+    def update_content_browser_import_status(self, import_id: int, user_id: int, status: str) -> bool:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE content_browser_imports SET status = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND user_id = ?",
+                    (str(status or 'captured'), int(import_id), int(user_id)),
+                )
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"更新 Chrome 内容采集状态失败: {exc}")
+                return False
+
+    def delete_content_browser_import(self, import_id: int, user_id: int) -> bool:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "DELETE FROM content_browser_imports WHERE id = ? AND user_id = ?",
+                    (int(import_id), int(user_id)),
+                )
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"删除 Chrome 内容采集失败: {exc}")
+                return False
+
+    # ==================== 个人 IP 内容工厂 ====================
+
+    @staticmethod
+    def _ip_profile_row_to_dict(row) -> Dict[str, Any]:
+        columns = (
+            'id', 'user_id', 'name', 'display_name', 'positioning', 'audience',
+            'topics_json', 'tone', 'opening_template', 'closing_template', 'bio',
+            'experiences_json', 'forbidden_phrases_json', 'visual_style',
+            'brand_colors_json', 'reference_images_json', 'platform_bios_json',
+            'is_default', 'created_at', 'updated_at',
+        )
+        data = dict(zip(columns, row))
+        for field, default in (
+            ('topics_json', []), ('experiences_json', []),
+            ('forbidden_phrases_json', []), ('brand_colors_json', []),
+            ('reference_images_json', []), ('platform_bios_json', {}),
+        ):
+            data[field[:-5]] = DBManager._json_loads_safe(data.pop(field), default) or default
+        data['is_default'] = bool(data.get('is_default'))
+        return data
+
+    def list_ip_profiles(self, user_id: int) -> List[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT id, user_id, name, display_name, positioning, audience,
+                           topics_json, tone, opening_template, closing_template, bio,
+                           experiences_json, forbidden_phrases_json, visual_style,
+                           brand_colors_json, reference_images_json, platform_bios_json,
+                           is_default, created_at, updated_at
+                    FROM ip_profiles WHERE user_id = ?
+                    ORDER BY is_default DESC, updated_at DESC, id DESC
+                ''', (int(user_id),))
+                return [self._ip_profile_row_to_dict(row) for row in cursor.fetchall()]
+            except Exception as exc:
+                logger.error(f"读取 IP 档案列表失败: {exc}")
+                return []
+
+    def get_ip_profile(self, profile_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT id, user_id, name, display_name, positioning, audience,
+                           topics_json, tone, opening_template, closing_template, bio,
+                           experiences_json, forbidden_phrases_json, visual_style,
+                           brand_colors_json, reference_images_json, platform_bios_json,
+                           is_default, created_at, updated_at
+                    FROM ip_profiles WHERE id = ? AND user_id = ?
+                ''', (int(profile_id), int(user_id)))
+                row = cursor.fetchone()
+                return self._ip_profile_row_to_dict(row) if row else None
+            except Exception as exc:
+                logger.error(f"读取 IP 档案失败: {exc}")
+                return None
+
+    def add_ip_profile(self, user_id: int, data: Dict[str, Any]) -> Optional[int]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                is_default = 1 if data.get('is_default') else 0
+                cursor.execute("SELECT COUNT(*) FROM ip_profiles WHERE user_id = ?", (int(user_id),))
+                if int(cursor.fetchone()[0] or 0) == 0:
+                    is_default = 1
+                if is_default:
+                    cursor.execute("UPDATE ip_profiles SET is_default = 0 WHERE user_id = ?", (int(user_id),))
+                cursor.execute('''
+                    INSERT INTO ip_profiles (
+                        user_id, name, display_name, positioning, audience, topics_json,
+                        tone, opening_template, closing_template, bio, experiences_json,
+                        forbidden_phrases_json, visual_style, brand_colors_json,
+                        reference_images_json, platform_bios_json, is_default
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    int(user_id), data.get('name'), data.get('display_name'),
+                    data.get('positioning'), data.get('audience'),
+                    self._json_dumps_safe(data.get('topics') or []), data.get('tone'),
+                    data.get('opening_template'), data.get('closing_template'), data.get('bio'),
+                    self._json_dumps_safe(data.get('experiences') or []),
+                    self._json_dumps_safe(data.get('forbidden_phrases') or []),
+                    data.get('visual_style'), self._json_dumps_safe(data.get('brand_colors') or []),
+                    self._json_dumps_safe(data.get('reference_images') or []),
+                    self._json_dumps_safe(data.get('platform_bios') or {}), is_default,
+                ))
+                profile_id = int(cursor.lastrowid)
+                self.conn.commit()
+                return profile_id
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"新增 IP 档案失败: {exc}")
+                return None
+
+    def update_ip_profile(self, profile_id: int, user_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {
+            'name', 'display_name', 'positioning', 'audience', 'topics', 'tone',
+            'opening_template', 'closing_template', 'bio', 'experiences',
+            'forbidden_phrases', 'visual_style', 'brand_colors', 'reference_images',
+            'platform_bios', 'is_default',
+        }
+        updates = {key: value for key, value in data.items() if key in allowed}
+        if not updates:
+            return False
+        json_fields = {
+            'topics', 'experiences', 'forbidden_phrases', 'brand_colors',
+            'reference_images', 'platform_bios',
+        }
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                if updates.get('is_default'):
+                    cursor.execute("UPDATE ip_profiles SET is_default = 0 WHERE user_id = ?", (int(user_id),))
+                fields: List[str] = []
+                params: List[Any] = []
+                for key, value in updates.items():
+                    column = f'{key}_json' if key in json_fields else key
+                    fields.append(f'{column} = ?')
+                    if key in json_fields:
+                        params.append(self._json_dumps_safe(value or ({} if key == 'platform_bios' else [])))
+                    elif key == 'is_default':
+                        params.append(1 if value else 0)
+                    else:
+                        params.append(value)
+                fields.append('updated_at = CURRENT_TIMESTAMP')
+                params.extend([int(profile_id), int(user_id)])
+                cursor.execute(f"UPDATE ip_profiles SET {', '.join(fields)} WHERE id = ? AND user_id = ?", params)
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"更新 IP 档案失败: {exc}")
+                return False
+
+    def delete_ip_profile(self, profile_id: int, user_id: int) -> bool:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT is_default FROM ip_profiles WHERE id = ? AND user_id = ?", (int(profile_id), int(user_id)))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                cursor.execute("DELETE FROM ip_profiles WHERE id = ? AND user_id = ?", (int(profile_id), int(user_id)))
+                if bool(row[0]):
+                    cursor.execute('''
+                        UPDATE ip_profiles SET is_default = 1, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = (SELECT id FROM ip_profiles WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1)
+                    ''', (int(user_id),))
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"删除 IP 档案失败: {exc}")
+                return False
+
+    # ==================== 个人 IP 视觉素材库 ====================
+
+    @staticmethod
+    def _ip_visual_kit_row_to_dict(row) -> Dict[str, Any]:
+        columns = (
+            'id', 'user_id', 'profile_id', 'character_name', 'character_description',
+            'signature_elements', 'style_keywords', 'negative_prompt', 'cover_rules',
+            'inline_rules', 'prompt_template', 'aspect_ratios_json', 'created_at', 'updated_at',
+        )
+        data = dict(zip(columns, row))
+        data['aspect_ratios'] = DBManager._json_loads_safe(data.pop('aspect_ratios_json'), {}) or {}
+        return data
+
+    def get_ip_visual_kit(self, profile_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT id, user_id, profile_id, character_name, character_description,
+                           signature_elements, style_keywords, negative_prompt, cover_rules,
+                           inline_rules, prompt_template, aspect_ratios_json, created_at, updated_at
+                    FROM ip_visual_kits WHERE profile_id = ? AND user_id = ?
+                ''', (int(profile_id), int(user_id)))
+                row = cursor.fetchone()
+                return self._ip_visual_kit_row_to_dict(row) if row else None
+            except Exception as exc:
+                logger.error(f"读取 IP 视觉设定失败: {exc}")
+                return None
+
+    def upsert_ip_visual_kit(self, profile_id: int, user_id: int, data: Dict[str, Any]) -> bool:
+        allowed = (
+            'character_name', 'character_description', 'signature_elements',
+            'style_keywords', 'negative_prompt', 'cover_rules', 'inline_rules',
+            'prompt_template', 'aspect_ratios',
+        )
+        values = {key: data.get(key) for key in allowed}
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT 1 FROM ip_profiles WHERE id = ? AND user_id = ?", (int(profile_id), int(user_id)))
+                if not cursor.fetchone():
+                    return False
+                cursor.execute('''
+                    INSERT INTO ip_visual_kits (
+                        user_id, profile_id, character_name, character_description,
+                        signature_elements, style_keywords, negative_prompt, cover_rules,
+                        inline_rules, prompt_template, aspect_ratios_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        character_name = excluded.character_name,
+                        character_description = excluded.character_description,
+                        signature_elements = excluded.signature_elements,
+                        style_keywords = excluded.style_keywords,
+                        negative_prompt = excluded.negative_prompt,
+                        cover_rules = excluded.cover_rules,
+                        inline_rules = excluded.inline_rules,
+                        prompt_template = excluded.prompt_template,
+                        aspect_ratios_json = excluded.aspect_ratios_json,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (
+                    int(user_id), int(profile_id), values['character_name'],
+                    values['character_description'], values['signature_elements'],
+                    values['style_keywords'], values['negative_prompt'], values['cover_rules'],
+                    values['inline_rules'], values['prompt_template'],
+                    self._json_dumps_safe(values.get('aspect_ratios') or {}),
+                ))
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"保存 IP 视觉设定失败: {exc}")
+                return False
+
+    @staticmethod
+    def _ip_visual_asset_row_to_dict(row) -> Dict[str, Any]:
+        columns = (
+            'id', 'user_id', 'profile_id', 'project_id', 'project_visual_id', 'name',
+            'asset_type', 'file_path', 'mime_type', 'source_type', 'tags_json', 'notes',
+            'prompt', 'width', 'height', 'sha256', 'is_primary', 'is_favorite',
+            'created_at', 'updated_at',
+        )
+        data = dict(zip(columns, row))
+        data['tags'] = DBManager._json_loads_safe(data.pop('tags_json'), []) or []
+        data['is_primary'] = bool(data.get('is_primary'))
+        data['is_favorite'] = bool(data.get('is_favorite'))
+        return data
+
+    _IP_VISUAL_ASSET_SELECT = '''
+        SELECT id, user_id, profile_id, project_id, project_visual_id, name,
+               asset_type, file_path, mime_type, source_type, tags_json, notes,
+               prompt, width, height, sha256, is_primary, is_favorite,
+               created_at, updated_at
+        FROM ip_visual_assets
+    '''
+
+    def list_ip_visual_assets(self, profile_id: int, user_id: int) -> List[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    self._IP_VISUAL_ASSET_SELECT +
+                    " WHERE profile_id = ? AND user_id = ? ORDER BY is_primary DESC, is_favorite DESC, updated_at DESC, id DESC",
+                    (int(profile_id), int(user_id)),
+                )
+                return [self._ip_visual_asset_row_to_dict(row) for row in cursor.fetchall()]
+            except Exception as exc:
+                logger.error(f"读取 IP 视觉素材失败: {exc}")
+                return []
+
+    def get_ip_visual_asset(self, asset_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(self._IP_VISUAL_ASSET_SELECT + " WHERE id = ? AND user_id = ?", (int(asset_id), int(user_id)))
+                row = cursor.fetchone()
+                return self._ip_visual_asset_row_to_dict(row) if row else None
+            except Exception as exc:
+                logger.error(f"读取 IP 视觉素材失败: {exc}")
+                return None
+
+    def add_ip_visual_asset(self, user_id: int, profile_id: int, data: Dict[str, Any]) -> Optional[int]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT 1 FROM ip_profiles WHERE id = ? AND user_id = ?", (int(profile_id), int(user_id)))
+                if not cursor.fetchone():
+                    return None
+                is_primary = 1 if data.get('is_primary') else 0
+                if is_primary:
+                    cursor.execute("UPDATE ip_visual_assets SET is_primary = 0 WHERE profile_id = ? AND user_id = ?", (int(profile_id), int(user_id)))
+                cursor.execute('''
+                    INSERT INTO ip_visual_assets (
+                        user_id, profile_id, project_id, project_visual_id, name,
+                        asset_type, file_path, mime_type, source_type, tags_json, notes,
+                        prompt, width, height, sha256, is_primary, is_favorite
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    int(user_id), int(profile_id), data.get('project_id'), data.get('project_visual_id'),
+                    data.get('name'), data.get('asset_type') or 'style_reference', data.get('file_path'),
+                    data.get('mime_type') or 'image/jpeg', data.get('source_type') or 'upload',
+                    self._json_dumps_safe(data.get('tags') or []), data.get('notes'), data.get('prompt'),
+                    data.get('width'), data.get('height'), data.get('sha256'), is_primary,
+                    1 if data.get('is_favorite') else 0,
+                ))
+                asset_id = int(cursor.lastrowid)
+                self.conn.commit()
+                return asset_id
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"新增 IP 视觉素材失败: {exc}")
+                return None
+
+    def update_ip_visual_asset(self, asset_id: int, user_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {'name', 'asset_type', 'tags', 'notes', 'prompt', 'is_primary', 'is_favorite'}
+        updates = {key: value for key, value in data.items() if key in allowed}
+        if not updates:
+            return False
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT profile_id FROM ip_visual_assets WHERE id = ? AND user_id = ?", (int(asset_id), int(user_id)))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                profile_id = int(row[0])
+                if updates.get('is_primary'):
+                    cursor.execute("UPDATE ip_visual_assets SET is_primary = 0 WHERE profile_id = ? AND user_id = ?", (profile_id, int(user_id)))
+                fields: List[str] = []
+                params: List[Any] = []
+                for key, value in updates.items():
+                    fields.append(f"{'tags_json' if key == 'tags' else key} = ?")
+                    if key == 'tags':
+                        params.append(self._json_dumps_safe(value or []))
+                    elif key in {'is_primary', 'is_favorite'}:
+                        params.append(1 if value else 0)
+                    else:
+                        params.append(value)
+                fields.append('updated_at = CURRENT_TIMESTAMP')
+                params.extend([int(asset_id), int(user_id)])
+                cursor.execute(f"UPDATE ip_visual_assets SET {', '.join(fields)} WHERE id = ? AND user_id = ?", params)
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"更新 IP 视觉素材失败: {exc}")
+                return False
+
+    def delete_ip_visual_asset(self, asset_id: int, user_id: int) -> bool:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("DELETE FROM ip_visual_assets WHERE id = ? AND user_id = ?", (int(asset_id), int(user_id)))
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"删除 IP 视觉素材失败: {exc}")
+                return False
+
+    @staticmethod
+    def _ip_project_row_to_dict(row) -> Dict[str, Any]:
+        columns = (
+            'id', 'user_id', 'profile_id', 'browser_import_id', 'source_url',
+            'source_title', 'source_author', 'source_text', 'source_images_json',
+            'analysis_json', 'brief_json', 'title', 'summary', 'master_markdown',
+            'variants_json', 'visuals_json', 'quality_json', 'package_dir',
+            'package_zip', 'status', 'error_message', 'created_at', 'updated_at',
+        )
+        data = dict(zip(columns, row))
+        for field, default in (
+            ('source_images_json', []), ('analysis_json', {}), ('brief_json', {}),
+            ('variants_json', {}), ('visuals_json', []), ('quality_json', {}),
+        ):
+            data[field[:-5]] = DBManager._json_loads_safe(data.pop(field), default) or default
+        return data
+
+    _IP_PROJECT_SELECT = '''
+        SELECT id, user_id, profile_id, browser_import_id, source_url, source_title,
+               source_author, source_text, source_images_json, analysis_json, brief_json,
+               title, summary, master_markdown, variants_json, visuals_json, quality_json,
+               package_dir, package_zip, status, error_message, created_at, updated_at
+        FROM ip_content_projects
+    '''
+
+    def add_ip_content_project(self, user_id: int, data: Dict[str, Any]) -> Optional[int]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    INSERT INTO ip_content_projects (
+                        user_id, profile_id, browser_import_id, source_url, source_title,
+                        source_author, source_text, source_images_json, analysis_json,
+                        brief_json, title, summary, master_markdown, variants_json,
+                        visuals_json, quality_json, package_dir, package_zip, status, error_message
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    int(user_id), data.get('profile_id'), data.get('browser_import_id'),
+                    data.get('source_url'), data.get('source_title'), data.get('source_author'),
+                    data.get('source_text'), self._json_dumps_safe(data.get('source_images') or []),
+                    self._json_dumps_safe(data.get('analysis') or {}),
+                    self._json_dumps_safe(data.get('brief') or {}), data.get('title'),
+                    data.get('summary'), data.get('master_markdown'),
+                    self._json_dumps_safe(data.get('variants') or {}),
+                    self._json_dumps_safe(data.get('visuals') or []),
+                    self._json_dumps_safe(data.get('quality') or {}), data.get('package_dir'),
+                    data.get('package_zip'), data.get('status') or 'draft', data.get('error_message'),
+                ))
+                project_id = int(cursor.lastrowid)
+                self.conn.commit()
+                return project_id
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"新增 IP 创作项目失败: {exc}")
+                return None
+
+    def get_ip_content_project(self, project_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(self._IP_PROJECT_SELECT + " WHERE id = ? AND user_id = ?", (int(project_id), int(user_id)))
+                row = cursor.fetchone()
+                return self._ip_project_row_to_dict(row) if row else None
+            except Exception as exc:
+                logger.error(f"读取 IP 创作项目失败: {exc}")
+                return None
+
+    def list_ip_content_projects(self, user_id: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 20), 100))
+        offset = (page - 1) * page_size
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT COUNT(*) FROM ip_content_projects WHERE user_id = ?", (int(user_id),))
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute(
+                    self._IP_PROJECT_SELECT + " WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (int(user_id), page_size, offset),
+                )
+                return {
+                    'items': [self._ip_project_row_to_dict(row) for row in cursor.fetchall()],
+                    'total': total, 'page': page, 'page_size': page_size,
+                    'pages': (total + page_size - 1) // page_size,
+                }
+            except Exception as exc:
+                logger.error(f"读取 IP 创作项目列表失败: {exc}")
+                return {'items': [], 'total': 0, 'page': page, 'page_size': page_size, 'pages': 0}
+
+    def update_ip_content_project(self, project_id: int, user_id: int, data: Dict[str, Any]) -> bool:
+        allowed = {
+            'profile_id', 'browser_import_id', 'source_url', 'source_title', 'source_author',
+            'source_text', 'source_images', 'analysis', 'brief', 'title', 'summary',
+            'master_markdown', 'variants', 'visuals', 'quality', 'package_dir',
+            'package_zip', 'status', 'error_message',
+        }
+        json_fields = {'source_images', 'analysis', 'brief', 'variants', 'visuals', 'quality'}
+        updates = {key: value for key, value in data.items() if key in allowed}
+        if not updates:
+            return False
+        fields: List[str] = []
+        params: List[Any] = []
+        for key, value in updates.items():
+            fields.append(f"{key + '_json' if key in json_fields else key} = ?")
+            params.append(self._json_dumps_safe(value or ([] if key in {'source_images', 'visuals'} else {})) if key in json_fields else value)
+        fields.append('updated_at = CURRENT_TIMESTAMP')
+        params.extend([int(project_id), int(user_id)])
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(f"UPDATE ip_content_projects SET {', '.join(fields)} WHERE id = ? AND user_id = ?", params)
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"更新 IP 创作项目失败: {exc}")
+                return False
+
+    def delete_ip_content_project(self, project_id: int, user_id: int) -> bool:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("DELETE FROM ip_content_projects WHERE id = ? AND user_id = ?", (int(project_id), int(user_id)))
+                changed = cursor.rowcount > 0
+                self.conn.commit()
+                return changed
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"删除 IP 创作项目失败: {exc}")
                 return False
 
 

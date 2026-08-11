@@ -14,12 +14,15 @@ import base64
 import hashlib
 import io
 import json
+import mimetypes
 import random
 import re
 import secrets
 import string
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
@@ -143,6 +146,51 @@ class QuarkDriveClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def generate_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float = 0.55,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call any OpenAI-compatible chat endpoint and return one JSON object.
+
+        This generic surface is shared by the IP content studio so it can reuse
+        the same encrypted model configuration as product generation.
+        """
+        if not self.text_model:
+            raise CatalogAIError("文案模型不能为空")
+        endpoint = self._api_endpoint(self.text_base_url, "chat/completions")
+        headers = self._auth_headers(self.text_api_key)
+        payload: Dict[str, Any] = {
+            "model": self.text_model,
+            "temperature": float(temperature),
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": str(system_prompt or "").strip()},
+                {"role": "user", "content": str(user_prompt or "").strip()},
+            ],
+        }
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+        response = await self._client.post(endpoint, headers=headers, json=payload)
+        if response.status_code in {400, 422} and any(
+            marker in response.text.lower()
+            for marker in ("response_format", "temperature", "max_tokens", "unsupported parameter")
+        ):
+            payload.pop("response_format", None)
+            payload.pop("temperature", None)
+            payload.pop("max_tokens", None)
+            response = await self._client.post(endpoint, headers=headers, json=payload)
+        if response.is_error:
+            raise CatalogAIError(f"文案生成失败: HTTP {response.status_code} {response.text[:300]}")
+        try:
+            data = response.json()
+            return parse_json_object(data["choices"][0]["message"]["content"])
+        except Exception as exc:
+            raise CatalogAIError(f"文案模型返回格式异常: {response.text[:500]}") from exc
+
     @staticmethod
     def _base_params() -> Dict[str, str]:
         return {
@@ -247,6 +295,132 @@ class QuarkDriveClient:
             page += 1
 
         return result
+
+    async def upload_file(self, file_path: Path, *, parent_fid: str = "0") -> QuarkEntry:
+        """Upload a generated small artifact through Quark's web multipart flow."""
+        path = Path(file_path)
+        if not path.is_file():
+            raise QuarkDriveError("待上传的夸克交付文件不存在")
+        size = path.stat().st_size
+        if size <= 0:
+            raise QuarkDriveError("待上传的夸克交付文件为空")
+        if size > 5 * 1024 * 1024:
+            raise QuarkDriveError("当前自动上传支持 5MB 以内的 PDF/ZIP，请缩小产物或手动上传")
+        content = path.read_bytes()
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        now_ms = int(time.time() * 1000)
+        pre = await self._request(
+            "POST",
+            f"{self.API_BASE}/file/upload/pre",
+            json_body={
+                "ccp_hash_update": True,
+                "parallel_upload": True,
+                "pdir_fid": str(parent_fid or "0"),
+                "dir_name": "",
+                "size": size,
+                "file_name": path.name,
+                "format_type": mime_type,
+                "l_updated_at": now_ms,
+                "l_created_at": now_ms,
+            },
+        )
+        upload = pre.get("data") or {}
+        task_id = str(upload.get("task_id") or "").strip()
+        auth_info = str(upload.get("auth_info") or "")
+        upload_id = str(upload.get("upload_id") or "")
+        obj_key = str(upload.get("obj_key") or "")
+        bucket = str(upload.get("bucket") or "ul-zb")
+        callback = upload.get("callback") or {}
+        if not all((task_id, upload_id, obj_key)):
+            raise QuarkDriveError("夸克预上传响应缺少任务信息")
+        await self._request(
+            "POST",
+            f"{self.API_BASE}/file/update/hash",
+            json_body={
+                "task_id": task_id,
+                "md5": hashlib.md5(content).hexdigest(),
+                "sha1": hashlib.sha1(content).hexdigest(),
+            },
+        )
+
+        oss_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        agent = "aliyun-sdk-js/1.0.0 Chrome 139.0.0.0 on OS X 10.15.7 64-bit"
+        put_meta = (
+            f"PUT\n\n{mime_type}\n{oss_date}\n"
+            f"x-oss-date:{oss_date}\nx-oss-user-agent:{agent}\n"
+            f"/{bucket}/{obj_key}?partNumber=1&uploadId={upload_id}"
+        )
+        put_auth = await self._request(
+            "POST", f"{self.API_BASE}/file/upload/auth",
+            json_body={"task_id": task_id, "auth_info": auth_info, "auth_meta": put_meta},
+        )
+        auth_key = str((put_auth.get("data") or {}).get("auth_key") or "")
+        put_url = f"https://{bucket}.pds.quark.cn/{obj_key}?partNumber=1&uploadId={upload_id}"
+        put_response = await self._client.put(
+            put_url,
+            content=content,
+            headers={
+                "Content-Type": mime_type,
+                "x-oss-date": oss_date,
+                "x-oss-user-agent": agent,
+                "authorization": auth_key,
+            },
+        )
+        if put_response.status_code != 200:
+            raise QuarkDriveError(f"夸克文件分片上传失败：HTTP {put_response.status_code}")
+        etag = str(put_response.headers.get("etag") or "").strip('"')
+        if not etag:
+            raise QuarkDriveError("夸克文件已上传但响应缺少 ETag")
+
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>\n'
+            f'<Part>\n<PartNumber>1</PartNumber>\n<ETag>"{etag}"</ETag>\n</Part>\n'
+            '</CompleteMultipartUpload>'
+        )
+        xml_md5 = base64.b64encode(hashlib.md5(xml.encode("utf-8")).digest()).decode("ascii")
+        callback_b64 = base64.b64encode(
+            json.dumps(callback, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        complete_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        complete_meta = (
+            f"POST\n{xml_md5}\napplication/xml\n{complete_date}\n"
+            f"x-oss-callback:{callback_b64}\nx-oss-date:{complete_date}\n"
+            f"x-oss-user-agent:{agent}\n/{bucket}/{obj_key}?uploadId={upload_id}"
+        )
+        complete_auth = await self._request(
+            "POST", f"{self.API_BASE}/file/upload/auth",
+            json_body={"task_id": task_id, "auth_info": auth_info, "auth_meta": complete_meta},
+        )
+        complete_key = str((complete_auth.get("data") or {}).get("auth_key") or "")
+        complete_response = await self._client.post(
+            f"https://{bucket}.pds.quark.cn/{obj_key}?uploadId={upload_id}",
+            content=xml,
+            headers={
+                "Content-Type": "application/xml",
+                "Content-MD5": xml_md5,
+                "x-oss-date": complete_date,
+                "x-oss-user-agent": agent,
+                "x-oss-callback": callback_b64,
+                "authorization": complete_key,
+            },
+        )
+        if complete_response.status_code not in {200, 203}:
+            raise QuarkDriveError(f"夸克文件合并失败：HTTP {complete_response.status_code}")
+        finish = await self._request(
+            "POST", f"{self.API_BASE}/file/upload/finish",
+            json_body={"task_id": task_id, "obj_key": obj_key},
+        )
+        finish_data = finish.get("data") or {}
+        candidates = [finish_data, finish_data.get("file") if isinstance(finish_data, dict) else None]
+        for candidate in candidates:
+            if isinstance(candidate, dict) and (candidate.get("fid") or candidate.get("file_name")):
+                entry = QuarkEntry.from_payload(candidate)
+                if entry.fid:
+                    return entry
+        for entry in await self.list_entries(parent_fid, max_items=100):
+            if entry.name == path.name:
+                return entry
+        raise QuarkDriveError("夸克上传已完成，但没有找到新文件，请刷新网盘后重试分享")
 
     async def create_share(
         self,
@@ -568,6 +742,19 @@ class CatalogAIClient:
             raise CatalogAIError("AI 接口地址不能为空")
         if clean_base.endswith(f"/{clean_endpoint}"):
             return clean_base
+        # The settings page accepts either an API root (``.../v1``) or a full
+        # image endpoint (``.../v1/images/generations``).  Reference-image
+        # editing needs to switch the latter to ``images/edits`` instead of
+        # accidentally appending a second endpoint path.
+        if clean_endpoint.startswith("images/") and re.search(
+            r"/images/(?:generations|edits)$", clean_base, flags=re.IGNORECASE
+        ):
+            return re.sub(
+                r"/images/(?:generations|edits)$",
+                f"/{clean_endpoint}",
+                clean_base,
+                flags=re.IGNORECASE,
+            )
         return f"{clean_base}/{clean_endpoint}"
 
     @staticmethod
@@ -575,6 +762,53 @@ class CatalogAIClient:
         if not api_key:
             raise CatalogAIError("AI API Key 不能为空")
         return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    async def generate_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float = 0.55,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call the configured OpenAI-compatible text model for strict JSON.
+
+        This is intentionally generic so higher-level workflows can share the
+        user's existing encrypted text-model configuration without duplicating
+        provider compatibility fallbacks.
+        """
+        if not self.text_model:
+            raise CatalogAIError("文案模型不能为空")
+        endpoint = self._api_endpoint(self.text_base_url, "chat/completions")
+        headers = self._auth_headers(self.text_api_key)
+        payload: Dict[str, Any] = {
+            "model": self.text_model,
+            "temperature": float(temperature),
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": str(system_prompt or "")},
+                {"role": "user", "content": str(user_prompt or "")},
+            ],
+        }
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+        response = await self._client.post(endpoint, headers=headers, json=payload)
+        if response.status_code in {400, 422} and any(
+            marker in response.text.lower()
+            for marker in ("response_format", "temperature", "max_tokens", "unsupported parameter")
+        ):
+            payload.pop("response_format", None)
+            payload.pop("temperature", None)
+            payload.pop("max_tokens", None)
+            response = await self._client.post(endpoint, headers=headers, json=payload)
+        if response.is_error:
+            raise CatalogAIError(f"文案生成失败: HTTP {response.status_code} {response.text[:500]}")
+        try:
+            api_payload = response.json()
+            content = api_payload["choices"][0]["message"]["content"]
+            return parse_json_object(content)
+        except Exception as exc:
+            raise CatalogAIError(f"文案模型返回格式异常: {response.text[:800]}") from exc
 
     async def generate_listing(
         self,
@@ -814,24 +1048,7 @@ class CatalogAIClient:
             "warnings": warnings,
         }
 
-    async def generate_cover(self, prompt: str) -> Dict[str, Any]:
-        if not self.image_model:
-            raise CatalogAIError("生图模型不能为空")
-        endpoint = self._api_endpoint(self.image_base_url, "images/generations")
-        headers = self._auth_headers(self.image_api_key)
-        request_payload = {
-            "model": self.image_model,
-            "prompt": str(prompt or "").strip(),
-            "size": self.image_size,
-            "n": 1,
-            "response_format": "b64_json",
-        }
-        response = await self._client.post(endpoint, headers=headers, json=request_payload)
-        if response.status_code == 400 and "response_format" in response.text.lower():
-            request_payload.pop("response_format", None)
-            response = await self._client.post(endpoint, headers=headers, json=request_payload)
-        if response.is_error:
-            raise CatalogAIError(f"封面生成失败: HTTP {response.status_code} {response.text[:300]}")
+    async def _parse_image_response(self, response: httpx.Response) -> Dict[str, Any]:
         try:
             payload = response.json()
             image_data = (payload.get("data") or [])[0]
@@ -864,6 +1081,108 @@ class CatalogAIClient:
             "height": height,
             "sha256": hashlib.sha256(jpeg_bytes).hexdigest(),
         }
+
+    async def generate_cover(self, prompt: str) -> Dict[str, Any]:
+        if not self.image_model:
+            raise CatalogAIError("生图模型不能为空")
+        endpoint = self._api_endpoint(self.image_base_url, "images/generations")
+        headers = self._auth_headers(self.image_api_key)
+        request_payload = {
+            "model": self.image_model,
+            "prompt": str(prompt or "").strip(),
+            "size": self.image_size,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+        response = await self._client.post(endpoint, headers=headers, json=request_payload)
+        if response.status_code == 400 and "response_format" in response.text.lower():
+            request_payload.pop("response_format", None)
+            response = await self._client.post(endpoint, headers=headers, json=request_payload)
+        if response.is_error:
+            raise CatalogAIError(f"封面生成失败: HTTP {response.status_code} {response.text[:300]}")
+        return await self._parse_image_response(response)
+
+    async def generate_with_references(
+        self,
+        prompt: str,
+        reference_paths: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Generate an image while preferring real visual references.
+
+        OpenAI-compatible providers vary in how they expose multipart image
+        edits.  Try the common multi-image and single-image forms, then keep the
+        workflow productive by falling back to the visual-fingerprint prompt.
+        """
+        candidates: List[Path] = []
+        for raw_path in reference_paths or []:
+            path = Path(str(raw_path or ""))
+            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                candidates.append(path)
+            if len(candidates) >= 4:
+                break
+        if not candidates:
+            result = await self.generate_cover(prompt)
+            result["reference_mode"] = "prompt_only"
+            result["reference_count"] = 0
+            return result
+
+        if not self.image_model:
+            raise CatalogAIError("生图模型不能为空")
+        endpoint = self._api_endpoint(self.image_base_url, "images/edits")
+        headers = self._auth_headers(self.image_api_key)
+        headers.pop("Content-Type", None)
+        attempts = [
+            (
+                [
+                    (
+                        "image[]",
+                        (path.name, path.read_bytes(), mimetypes.guess_type(path.name)[0] or "image/jpeg"),
+                    )
+                    for path in candidates
+                ],
+                {
+                    "model": self.image_model, "prompt": str(prompt or "").strip(),
+                    "size": self.image_size, "n": "1", "response_format": "b64_json",
+                    "input_fidelity": "high",
+                },
+            ),
+            (
+                [(
+                    "image",
+                    (
+                        candidates[0].name,
+                        candidates[0].read_bytes(),
+                        mimetypes.guess_type(candidates[0].name)[0] or "image/jpeg",
+                    ),
+                )],
+                {
+                    "model": self.image_model, "prompt": str(prompt or "").strip(),
+                    "size": self.image_size, "n": "1",
+                },
+            ),
+        ]
+        edit_errors: List[str] = []
+        for files, data in attempts:
+            try:
+                response = await self._client.post(endpoint, headers=headers, data=data, files=files)
+                if response.is_error:
+                    edit_errors.append(f"HTTP {response.status_code} {response.text[:180]}")
+                    continue
+                result = await self._parse_image_response(response)
+                result["reference_mode"] = "image_edit"
+                result["reference_count"] = len(candidates)
+                return result
+            except (httpx.HTTPError, CatalogAIError, OSError) as exc:
+                edit_errors.append(str(exc)[:180])
+
+        result = await self.generate_cover(prompt)
+        result["reference_mode"] = "prompt_fallback"
+        result["reference_count"] = len(candidates)
+        result["reference_warning"] = (
+            "参考图编辑接口未被当前生图服务接受，已使用同一视觉指纹提示词生成"
+            + (f"（{edit_errors[-1]}）" if edit_errors else "")
+        )
+        return result
 
 
 def parse_json_object(value: Any) -> Dict[str, Any]:

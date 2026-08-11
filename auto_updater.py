@@ -95,8 +95,28 @@ class AutoUpdater:
     # 默认 GitHub 更新源配置
     DEFAULT_GITHUB_API_BASE = "https://api.github.com"
     DEFAULT_GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
-    DEFAULT_GITHUB_OWNER = "GuDong2003"
-    DEFAULT_GITHUB_REPO = "xianyu-auto-reply-fix"
+    DEFAULT_GITHUB_OWNER = "Wu636"
+    DEFAULT_GITHUB_REPO = "xianyu-auto-reply"
+
+    # 这个项目包含大量仅存在于用户分支的定制代码。网页热更新曾经允许远端
+    # manifest 覆盖、删除本地源码，因此现在默认只保留“检查更新”能力；源码
+    # 变更统一通过 Git 分支完成。确需恢复旧热更新流程时也必须显式设置开关。
+    MUTATION_ENV = "XIANYU_ENABLE_SELF_UPDATE"
+    DELETION_ENV = "XIANYU_ENABLE_UPDATE_DELETIONS"
+    CRITICAL_DELETE_PATHS = {
+        '.xianyu-project-root',
+        '.git/',
+        'data/',
+        'venv/',
+        'backups/',
+        'update_backup/',
+        'Start.py',
+        'start.sh',
+        'stop.sh',
+        'auto_updater.py',
+        'reply_server.py',
+        'db_manager.py',
+    }
     
     # 可热更新的静态文件类型（通常不需要重启）
     HOT_UPDATABLE_EXTENSIONS = {
@@ -162,6 +182,8 @@ class AutoUpdater:
         self.update_server = update_server or f"{self.github_owner}/{self.github_repo}"
         self.current_version = current_version
         self.backup_dir = self.app_dir / "update_backup"
+        self.mutations_enabled = self._env_enabled(self.MUTATION_ENV)
+        self.deletions_enabled = self._env_enabled(self.DELETION_ENV)
         
         # 更新状态
         self.progress = UpdateProgress(status=UpdateStatus.IDLE)
@@ -172,8 +194,31 @@ class AutoUpdater:
         
         logger.info(
             "自动更新器初始化: "
-            f"app_dir={self.app_dir}, repo={self.github_owner}/{self.github_repo}, version={self.current_version}"
+            f"app_dir={self.app_dir}, repo={self.github_owner}/{self.github_repo}, "
+            f"version={self.current_version}, mutations_enabled={self.mutations_enabled}, "
+            f"deletions_enabled={self.deletions_enabled}"
         )
+
+    @staticmethod
+    def _env_enabled(name: str) -> bool:
+        return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _require_mutations_enabled(self) -> None:
+        if not self.mutations_enabled:
+            raise RuntimeError("网页热更新已锁定；请通过 Git 分支完成源码更新")
+
+    def _is_critical_delete_path(self, path: str) -> bool:
+        normalized = str(path or "").strip().replace('\\', '/').lstrip('./').lower()
+        if not normalized:
+            return True
+        for protected in self.CRITICAL_DELETE_PATHS:
+            candidate = protected.lower()
+            if candidate.endswith('/'):
+                if normalized == candidate.rstrip('/') or normalized.startswith(candidate):
+                    return True
+            elif normalized == candidate:
+                return True
+        return False
     
     def add_progress_callback(self, callback: callable):
         """添加进度回调"""
@@ -569,6 +614,7 @@ class AutoUpdater:
         Returns:
             (是否成功, 更新的文件列表, 是否需要重启)
         """
+        self._require_mutations_enabled()
         if not files_to_update:
             return True, [], False
         
@@ -669,6 +715,9 @@ class AutoUpdater:
         Returns:
             (是否成功, 删除的文件列表, 是否需要重启)
         """
+        self._require_mutations_enabled()
+        if not self.deletions_enabled:
+            raise RuntimeError("远端清单删除功能已锁定；请通过 Git 审核删除变更")
         if not files_to_delete:
             return True, [], False
 
@@ -687,6 +736,13 @@ class AutoUpdater:
                 current_index=index + 1,
                 message=f"正在删除旧文件: {deleted_file.path}"
             )
+
+            if self._is_critical_delete_path(deleted_file.path):
+                self._update_progress(
+                    status=UpdateStatus.FAILED,
+                    error=f"关键路径受保护: {deleted_file.path}"
+                )
+                return False, deleted_paths, needs_restart
 
             local_path = self._safe_join_under_app_dir(deleted_file.path)
             if local_path is None:
@@ -730,6 +786,7 @@ class AutoUpdater:
         Returns:
             更新结果
         """
+        self._require_mutations_enabled()
         result = {
             "success": False,
             "message": "",

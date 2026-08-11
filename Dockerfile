@@ -42,6 +42,9 @@ RUN apt-get -o Acquire::Retries=5 update && \
         libfreetype6-dev \
         fonts-dejavu-core \
         fonts-liberation \
+        fonts-noto-cjk \
+        fonts-wqy-zenhei \
+        poppler-utils \
         # Playwright浏览器依赖
         libnss3 \
         libnspr4 \

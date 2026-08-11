@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>X 长文采集</title>
+  <style>
+    body{font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;width:340px;margin:0;padding:18px;color:#172033;background:#f7f8fc}
+    h1{font-size:18px;margin:0 0 12px}.field{margin:10px 0}.field label{display:block;font-weight:650;margin-bottom:5px}
+    input{box-sizing:border-box;width:100%;border:1px solid #d7dce8;border-radius:9px;padding:9px;background:white}
+    button{width:100%;border:0;border-radius:9px;background:#4f46e5;color:white;font-weight:700;padding:11px;margin-top:8px;cursor:pointer}
+    button:disabled{opacity:.55;cursor:wait}.tip{font-size:12px;color:#667085;margin-top:8px}.status{margin-top:12px;padding:9px;border-radius:8px;background:#eef2ff;word-break:break-word}.status.error{background:#fff0f0;color:#b42318}.status.ok{background:#ecfdf3;color:#027a48}
+  </style>
+</head>
+<body>
+  <h1>采集当前 X 长文 / 线程</h1>
+  <div class="field"><label for="server">本地服务地址</label><input id="server" value="http://127.0.0.1:8090"></div>
+  <div class="field"><label for="token">扩展配对码</label><input id="token" type="password" placeholder="在“链接商品化”页面生成"></div>
+  <button id="capture">采集当前页面</button>
+  <div class="tip">会采集当前页面已加载的长文、同作者线程和最多 8 张原图；X Cookie 始终留在 Chrome 内。</div>
+  <div id="status" class="status">等待采集</div>
+  <script src="popup.js"></script>
+</body>
+</html>

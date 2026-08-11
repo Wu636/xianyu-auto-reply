@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "X 长文采集到闲鱼商品化",
+  "version": "1.0.1",
+  "description": "读取当前已登录的 X 长文、线程和图片，并发送到本机闲鱼管理系统。",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://pbs.twimg.com/*",
+    "https://ton.twimg.com/*",
+    "http://127.0.0.1:8090/*",
+    "http://localhost:8090/*"
+  ],
+  "action": {
+    "default_title": "采集当前 X 页面",
+    "default_popup": "popup.html"
+  }
+}

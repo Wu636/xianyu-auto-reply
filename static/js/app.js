@@ -49,6 +49,16 @@ let itemPublishLogs = [];
 let aiProductCreating = false;
 let aiProductReferencePreviewUrls = [];
 let contentProductCreating = false;
+let contentProductBrowserImportId = null;
+let contentProductBrowserImages = [];
+let ipStudioMeta = { angles: [], platforms: [], browser_imports: [] };
+let ipProfiles = [];
+let ipCurrentProject = null;
+let ipSourceImages = [];
+let ipVisualObjectUrls = [];
+let ipVisualLibraryObjectUrls = [];
+let ipVisualLibrary = { visual_kit: {}, assets: [], asset_types: [] };
+let ipStudioBusy = false;
 let quarkCatalogJobTimer = null;
 let quarkFolderPickerStack = [];
 let quarkCatalogPreviewState = null;
@@ -142,6 +152,11 @@ function showSection(sectionName) {
     case 'content-products':
         loadContentProductAccounts();
         loadContentProducts();
+        loadContentBrowserImports();
+        loadContentProductSettings();
+        break;
+    case 'ip-content-studio':
+        loadIPContentStudio();
         break;
     case 'items':           // 【商品管理菜单】
         loadItems();
@@ -10233,6 +10248,8 @@ const DEFAULT_MENU_ITEMS = [
     { id: 'dashboard', name: '仪表盘', icon: 'bi-speedometer2', required: true },
     { id: 'accounts', name: '账号管理', icon: 'bi-person-circle', required: false },
     { id: 'item-publish', name: '商品发布', icon: 'bi-bag-plus', required: false },
+    { id: 'content-products', name: '链接商品化', icon: 'bi-link-45deg', required: false },
+    { id: 'ip-content-studio', name: 'IP 内容工厂', icon: 'bi-person-bounding-box', required: false },
     { id: 'items', name: '商品管理', icon: 'bi-box-seam', required: false },
     { id: 'orders', name: '订单管理', icon: 'bi-receipt-cutoff', required: false },
     { id: 'auto-reply', name: '自动回复', icon: 'bi-chat-left-text', required: false },
@@ -11351,11 +11368,98 @@ async function loadContentProductAccounts() {
     }
 }
 
+async function createContentImportToken() {
+    try {
+        const result = await requestItemPublishJson('/content-products/import-token', { method: 'POST' });
+        const display = document.getElementById('contentImportTokenDisplay');
+        if (display) display.textContent = result.token || '';
+        showToast(`配对码已生成；扩展目录：${result.extension_path || 'chrome-extension'}`, 'success');
+    } catch (error) {
+        showToast(error.message || '生成扩展配对码失败', 'danger');
+    }
+}
+
+async function loadContentBrowserImports() {
+    const select = document.getElementById('contentBrowserImportSelect');
+    if (!select) return;
+    const current = select.value;
+    try {
+        const result = await requestItemPublishJson('/content-products/browser-imports');
+        const items = result.items || [];
+        select.innerHTML = '<option value="">手动输入链接/正文</option>' + items.map(item => {
+            const suffix = `${item.author ? ` @${item.author}` : ''} · ${item.image_count || 0} 图 · ${item.created_at || ''}`;
+            return `<option value="${Number(item.id)}">${escapeHtml((item.source_title || 'X 长文') + suffix)}</option>`;
+        }).join('');
+        if (current && items.some(item => String(item.id) === String(current))) select.value = current;
+    } catch (error) {
+        console.warn('Chrome 采集列表加载失败:', error);
+    }
+}
+
+async function loadSelectedBrowserImport() {
+    const id = Number(document.getElementById('contentBrowserImportSelect')?.value || 0);
+    contentProductBrowserImportId = id || null;
+    contentProductBrowserImages = [];
+    if (!id) return;
+    try {
+        const result = await requestItemPublishJson(`/content-products/browser-imports/${id}`);
+        const item = result.item || {};
+        document.getElementById('contentProductSourceUrl').value = item.source_url || '';
+        document.getElementById('contentProductSourceText').value = item.source_text || '';
+        contentProductBrowserImages = item.images || [];
+        setContentProductStatus(`已载入 Chrome 采集：${(item.metadata?.posts || []).length || 1} 段正文、${contentProductBrowserImages.length} 张图片`, 'info');
+    } catch (error) {
+        showToast(error.message || '载入 Chrome 采集失败', 'danger');
+    }
+}
+
+async function loadContentProductSettings() {
+    try {
+        const result = await requestItemPublishJson('/content-products/settings');
+        const settings = result.settings || {};
+        const pairs = {
+            contentFeishuAppId: settings.feishu_app_id || '',
+            contentFeishuFolderToken: settings.feishu_folder_token || '',
+            contentProductQuarkFid: settings.quark_parent_fid || ''
+        };
+        Object.entries(pairs).forEach(([id, value]) => { const element = document.getElementById(id); if (element) element.value = value; });
+        const secret = document.getElementById('contentFeishuAppSecret');
+        if (secret) secret.placeholder = settings.feishu_app_secret_configured ? '已加密保存；留空保留原值' : '填写飞书 App Secret';
+    } catch (error) {
+        console.warn('内容商品化配置加载失败:', error);
+    }
+}
+
+async function saveContentProductSettings() {
+    try {
+        await requestItemPublishJson('/content-products/settings', {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                feishu_app_id: document.getElementById('contentFeishuAppId')?.value.trim() || '',
+                feishu_app_secret: document.getElementById('contentFeishuAppSecret')?.value.trim() || '',
+                feishu_folder_token: document.getElementById('contentFeishuFolderToken')?.value.trim() || '',
+                quark_parent_fid: document.getElementById('contentProductQuarkFid')?.value.trim() || ''
+            })
+        });
+        const secret = document.getElementById('contentFeishuAppSecret');
+        if (secret) secret.value = '';
+        await loadContentProductSettings();
+        showToast('飞书/夸克交付配置已保存', 'success');
+    } catch (error) {
+        showToast(error.message || '配置保存失败', 'danger');
+    }
+}
+
 function clearContentProductForm() {
     ['contentProductSourceUrl', 'contentProductSourceText', 'contentProductCategory', 'contentProductPrice', 'contentProductOriginalPrice', 'contentProductDeliveryText']
         .forEach(id => { const element = document.getElementById(id); if (element) element.value = ''; });
-    const mode = document.getElementById('contentProductOutputMode');
-    if (mode) mode.value = 'bundle';
+    document.querySelectorAll('.content-output-format').forEach(input => {
+        input.checked = ['markdown', 'pdf', 'skill'].includes(input.value);
+    });
+    contentProductBrowserImportId = null;
+    contentProductBrowserImages = [];
+    const browserSelect = document.getElementById('contentBrowserImportSelect');
+    if (browserSelect) browserSelect.value = '';
     const rights = document.getElementById('contentProductRightsStatus');
     if (rights) rights.value = 'reference_only';
     const research = document.getElementById('contentProductMarketResearch');
@@ -11371,6 +11475,11 @@ async function generateContentProduct(publishAfter = false) {
     const sourceText = document.getElementById('contentProductSourceText')?.value.trim() || '';
     const accountId = document.getElementById('contentProductAccount')?.value || '';
     const rightsStatus = document.getElementById('contentProductRightsStatus')?.value || 'reference_only';
+    const outputFormats = [...document.querySelectorAll('.content-output-format:checked')].map(input => input.value);
+    if (!outputFormats.length) {
+        showToast('请至少选择一种交付形式', 'warning');
+        return false;
+    }
     if (!sourceUrl && sourceText.length < 80) {
         showToast('请提供文章链接，或粘贴至少 80 个字的正文', 'warning');
         return false;
@@ -11394,7 +11503,9 @@ async function generateContentProduct(publishAfter = false) {
             body: JSON.stringify({
                 source_url: sourceUrl || null,
                 source_text: sourceText || null,
-                output_mode: document.getElementById('contentProductOutputMode')?.value || 'bundle',
+                browser_import_id: contentProductBrowserImportId,
+                reference_images: contentProductBrowserImages,
+                output_formats: outputFormats,
                 rights_status: rightsStatus,
                 category_hint: document.getElementById('contentProductCategory')?.value.trim() || null,
                 market_research: Boolean(document.getElementById('contentProductMarketResearch')?.checked),
@@ -11402,6 +11513,9 @@ async function generateContentProduct(publishAfter = false) {
                 original_price_hint: parseOptionalPublishNumber(document.getElementById('contentProductOriginalPrice')?.value, '原价'),
                 delivery_method: document.getElementById('contentProductDelivery')?.value || '无需邮寄',
                 delivery_text: document.getElementById('contentProductDeliveryText')?.value.trim() || null,
+                upload_to_quark: Boolean(document.getElementById('contentProductUploadQuark')?.checked),
+                quark_artifact: document.getElementById('contentProductQuarkArtifact')?.value || 'pdf',
+                quark_parent_fid: document.getElementById('contentProductQuarkFid')?.value.trim() || null,
                 account_id: accountId || null,
                 publish_after_review: Boolean(publishAfter)
             })
@@ -11451,13 +11565,82 @@ async function loadContentProducts() {
               <td><span class="badge text-bg-${item.status === 'failed' ? 'danger' : 'success'}">${escapeHtml(statusText[item.status] || item.status || '-')}</span></td>
               <td class="small">${escapeHtml(item.updated_at || item.created_at || '-')}</td>
               <td class="text-nowrap">
-                ${item.download_url ? `<a class="btn btn-sm btn-outline-primary me-1" href="${escapeHtml(item.download_url)}" target="_blank"><i class="bi bi-download"></i></a>` : ''}
+                ${item.download_url ? `<button class="btn btn-sm btn-outline-primary me-1" type="button" onclick="downloadContentProduct(${Number(item.id)}, this)" title="下载内容包"><i class="bi bi-download"></i></button>` : ''}
+                ${item.metadata?.feishu?.url ? `<a class="btn btn-sm btn-outline-info me-1" href="${escapeHtml(item.metadata.feishu.url)}" target="_blank" title="打开飞书文档"><i class="bi bi-file-earmark-richtext"></i></a>` : ''}
+                ${item.metadata?.quark_delivery?.share_url ? `<button class="btn btn-sm btn-outline-warning me-1" data-delivery="${escapeHtml(item.metadata.quark_delivery.delivery_text || item.metadata.quark_delivery.share_url)}" onclick="copyContentDelivery(this.dataset.delivery)" title="复制夸克交付信息"><i class="bi bi-cloud-check"></i></button>` : ''}
                 <button class="btn btn-sm btn-outline-secondary me-1" onclick="loadContentProductIntoPublish(${Number(item.id)})"><i class="bi bi-pencil"></i></button>
                 <button class="btn btn-sm btn-outline-danger" onclick="deleteContentProduct(${Number(item.id)})"><i class="bi bi-trash"></i></button>
               </td>
             </tr>`).join('')}</tbody></table>`;
     } catch (error) {
         container.innerHTML = `<div class="text-danger small">${escapeHtml(error.message || '加载失败')}</div>`;
+    }
+}
+
+async function downloadContentProduct(productId, button) {
+    const originalHtml = button?.innerHTML || '<i class="bi bi-download"></i>';
+    if (button) {
+        button.disabled = true;
+        button.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>';
+    }
+    try {
+        const response = await fetch(`${apiBase}/content-products/${encodeURIComponent(productId)}/download`, {
+            headers: { 'Authorization': `Bearer ${getAuthToken()}` }
+        });
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            authToken = '';
+            showToast('后台登录已失效，请重新登录', 'warning');
+            window.setTimeout(() => { window.location.href = '/'; }, 800);
+            return;
+        }
+        if (!response.ok) {
+            const responseText = await response.text();
+            let message = responseText || `HTTP ${response.status}`;
+            try {
+                const payload = JSON.parse(responseText);
+                message = payload.detail || payload.message || message;
+            } catch {}
+            throw new Error(message);
+        }
+
+        const blob = await response.blob();
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+        const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
+        let filename = `content-product-${productId}.zip`;
+        if (utf8Match) {
+            try { filename = decodeURIComponent(utf8Match[1]); } catch { filename = utf8Match[1]; }
+        } else if (plainMatch) {
+            filename = plainMatch[1];
+        }
+
+        const objectUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        showToast('内容包下载已开始', 'success');
+    } catch (error) {
+        console.error('下载内容包失败:', error);
+        showToast(error.message || '内容包下载失败', 'danger');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function copyContentDelivery(text) {
+    try {
+        await navigator.clipboard.writeText(text);
+        showToast('夸克永久链接和提取码已复制', 'success');
+    } catch (error) {
+        showToast('复制失败，请打开详情手动复制', 'warning');
     }
 }
 
@@ -11484,6 +11667,671 @@ async function deleteContentProduct(productId) {
     } catch (error) {
         showToast(error.message || '删除失败', 'danger');
     }
+}
+
+// ================================
+// 个人 IP 内容工厂
+// ================================
+function setIPStudioStatus(message, type = 'light') {
+    const element = document.getElementById('ipStudioStatus');
+    if (!element) return;
+    element.className = `alert alert-${type} border mt-3 mb-0 small`;
+    element.textContent = message || '';
+}
+
+function ipLines(value) {
+    return String(value || '').split(/\r?\n|[,，]/).map(item => item.trim()).filter(Boolean);
+}
+
+async function loadIPContentStudio() {
+    try {
+        const [metaResult, profilesResult] = await Promise.all([
+            requestItemPublishJson('/ip-content-studio/meta'),
+            requestItemPublishJson('/ip-content-studio/profiles')
+        ]);
+        ipStudioMeta = metaResult || { angles: [], platforms: [], browser_imports: [] };
+        ipProfiles = profilesResult.items || [];
+        renderIPStudioMeta();
+        renderIPProfileSelect();
+        if (!document.getElementById('ipProfileId')?.value && ipProfiles.length) {
+            const selected = ipProfiles.find(item => item.is_default) || ipProfiles[0];
+            document.getElementById('ipProfileSelect').value = String(selected.id);
+            selectIPProfile();
+        }
+        await loadIPProjects();
+    } catch (error) {
+        setIPStudioStatus(error.message || 'IP 内容工厂加载失败', 'danger');
+    }
+}
+
+function renderIPStudioMeta() {
+    const importSelect = document.getElementById('ipSourceImport');
+    if (importSelect) {
+        const current = importSelect.value;
+        importSelect.innerHTML = '<option value="">手动输入链接/正文</option>' + (ipStudioMeta.browser_imports || []).map(item =>
+            `<option value="${Number(item.id)}">${escapeHtml(item.source_title || '未命名采集')} · ${escapeHtml(item.author || '未知作者')} · ${Number(item.image_count || 0)} 图</option>`
+        ).join('');
+        if (current) importSelect.value = current;
+    }
+    const angleSelect = document.getElementById('ipCreativeAngle');
+    if (angleSelect) angleSelect.innerHTML = (ipStudioMeta.angles || []).map(item => `<option value="${escapeHtml(item.key)}">${escapeHtml(item.label)}</option>`).join('');
+    const platforms = document.getElementById('ipPlatformChecks');
+    if (platforms) platforms.innerHTML = (ipStudioMeta.platforms || []).map(item => `
+        <div class="form-check"><input class="form-check-input ip-platform-check" type="checkbox" value="${escapeHtml(item.key)}" id="ipPlatform-${escapeHtml(item.key)}" checked><label class="form-check-label" for="ipPlatform-${escapeHtml(item.key)}">${escapeHtml(item.label)}</label></div>
+    `).join('');
+}
+
+function renderIPProfileSelect() {
+    const select = document.getElementById('ipProfileSelect');
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = '<option value="">新建档案</option>' + ipProfiles.map(item => `<option value="${Number(item.id)}">${item.is_default ? '★ ' : ''}${escapeHtml(item.name || item.display_name || '未命名档案')}</option>`).join('');
+    if (current && ipProfiles.some(item => String(item.id) === String(current))) select.value = current;
+}
+
+function newIPProfile() {
+    document.getElementById('ipProfileSelect').value = '';
+    ['ipProfileId', 'ipProfileName', 'ipDisplayName', 'ipPositioning', 'ipAudience', 'ipTopics', 'ipTone', 'ipOpening', 'ipClosing', 'ipBio', 'ipExperiences', 'ipForbidden', 'ipVisualStyle', 'ipBrandColors']
+        .forEach(id => { const element = document.getElementById(id); if (element) element.value = ''; });
+    const deleteButton = document.getElementById('ipDeleteProfileBtn');
+    if (deleteButton) deleteButton.disabled = true;
+    resetIPVisualLibrary();
+}
+
+function selectIPProfile() {
+    const id = Number(document.getElementById('ipProfileSelect')?.value || 0);
+    if (!id) {
+        newIPProfile();
+        return;
+    }
+    const profile = ipProfiles.find(item => Number(item.id) === id);
+    if (!profile) return;
+    const values = {
+        ipProfileId: profile.id,
+        ipProfileName: profile.name || '',
+        ipDisplayName: profile.display_name || '',
+        ipPositioning: profile.positioning || '',
+        ipAudience: profile.audience || '',
+        ipTopics: (profile.topics || []).join(', '),
+        ipTone: profile.tone || '',
+        ipOpening: profile.opening_template || '',
+        ipClosing: profile.closing_template || '',
+        ipBio: profile.bio || '',
+        ipExperiences: (profile.experiences || []).join('\n'),
+        ipForbidden: (profile.forbidden_phrases || []).join('\n'),
+        ipVisualStyle: profile.visual_style || '',
+        ipBrandColors: (profile.brand_colors || []).join(', ')
+    };
+    Object.entries(values).forEach(([idName, value]) => { const element = document.getElementById(idName); if (element) element.value = value; });
+    const deleteButton = document.getElementById('ipDeleteProfileBtn');
+    if (deleteButton) deleteButton.disabled = false;
+    void loadIPVisualLibrary();
+}
+
+function getIPProfilePayload() {
+    return {
+        name: document.getElementById('ipProfileName')?.value.trim() || '',
+        display_name: document.getElementById('ipDisplayName')?.value.trim() || '',
+        positioning: document.getElementById('ipPositioning')?.value.trim() || '',
+        audience: document.getElementById('ipAudience')?.value.trim() || '',
+        topics: ipLines(document.getElementById('ipTopics')?.value),
+        tone: document.getElementById('ipTone')?.value.trim() || '',
+        opening_template: document.getElementById('ipOpening')?.value.trim() || '',
+        closing_template: document.getElementById('ipClosing')?.value.trim() || '',
+        bio: document.getElementById('ipBio')?.value.trim() || '',
+        experiences: String(document.getElementById('ipExperiences')?.value || '').split(/\r?\n/).map(item => item.trim()).filter(Boolean),
+        forbidden_phrases: String(document.getElementById('ipForbidden')?.value || '').split(/\r?\n/).map(item => item.trim()).filter(Boolean),
+        visual_style: document.getElementById('ipVisualStyle')?.value.trim() || '',
+        brand_colors: ipLines(document.getElementById('ipBrandColors')?.value),
+        reference_images: [], platform_bios: {}, is_default: ipProfiles.length === 0
+    };
+}
+
+async function saveIPProfile() {
+    const payload = getIPProfilePayload();
+    if (!payload.name || !payload.display_name) {
+        showToast('请填写档案名称和对外称呼', 'warning');
+        return;
+    }
+    const id = Number(document.getElementById('ipProfileId')?.value || 0);
+    try {
+        const result = await requestItemPublishJson(id ? `/ip-content-studio/profiles/${id}` : '/ip-content-studio/profiles', {
+            method: id ? 'PUT' : 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        });
+        const profilesResult = await requestItemPublishJson('/ip-content-studio/profiles');
+        ipProfiles = profilesResult.items || [];
+        renderIPProfileSelect();
+        document.getElementById('ipProfileSelect').value = String(result.profile?.id || id || '');
+        selectIPProfile();
+        showToast('IP 档案已保存', 'success');
+    } catch (error) {
+        showToast(error.message || 'IP 档案保存失败', 'danger');
+    }
+}
+
+async function deleteIPProfile() {
+    const id = Number(document.getElementById('ipProfileId')?.value || 0);
+    if (!id || !confirm('确定删除这个 IP 档案吗？已有项目会阻止误删。')) return;
+    try {
+        await requestItemPublishJson(`/ip-content-studio/profiles/${id}`, {method: 'DELETE'});
+        ipProfiles = (await requestItemPublishJson('/ip-content-studio/profiles')).items || [];
+        renderIPProfileSelect();
+        newIPProfile();
+        showToast('IP 档案已删除', 'success');
+    } catch (error) {
+        showToast(error.message || 'IP 档案删除失败', 'danger');
+    }
+}
+
+function setIPVisualLibraryStatus(message, type = 'light') {
+    const element = document.getElementById('ipVisualLibraryStatus');
+    if (!element) return;
+    element.className = `alert alert-${type} border small`;
+    element.textContent = message || '';
+}
+
+function revokeIPVisualLibraryUrls() {
+    ipVisualLibraryObjectUrls.forEach(url => URL.revokeObjectURL(url));
+    ipVisualLibraryObjectUrls = [];
+}
+
+function resetIPVisualLibrary() {
+    revokeIPVisualLibraryUrls();
+    ipVisualLibrary = { visual_kit: {}, assets: [], asset_types: [] };
+    ['ipKitCharacterName', 'ipKitCharacterDescription', 'ipKitSignatureElements', 'ipKitStyleKeywords', 'ipKitNegativePrompt', 'ipKitCoverRules', 'ipKitInlineRules', 'ipKitPromptTemplate']
+        .forEach(id => { const element = document.getElementById(id); if (element) element.value = ''; });
+    const grid = document.getElementById('ipVisualAssetGrid');
+    if (grid) grid.innerHTML = '<div class="text-muted small">保存并选择 IP 档案后即可添加视觉素材</div>';
+    const count = document.getElementById('ipVisualAssetCount');
+    if (count) count.textContent = '0 张';
+    const badge = document.getElementById('ipVisualFingerprintBadge');
+    if (badge) badge.textContent = '请选择 IP 档案';
+    setIPVisualLibraryStatus('保存 IP 档案后即可建立专属视觉素材库。', 'light');
+}
+
+function renderIPVisualAssetTypeOptions() {
+    const options = (ipVisualLibrary.asset_types || []).map(item => `<option value="${escapeHtml(item.key)}">${escapeHtml(item.label)}</option>`).join('');
+    ['ipVisualUploadType', 'ipVisualGenerateType'].forEach(id => {
+        const select = document.getElementById(id);
+        if (!select) return;
+        const current = select.value;
+        select.innerHTML = options;
+        if ([...select.options].some(option => option.value === current)) select.value = current;
+    });
+    const generateType = document.getElementById('ipVisualGenerateType');
+    if (generateType && [...generateType.options].some(option => option.value === 'generated')) generateType.value = 'generated';
+}
+
+async function loadIPVisualLibrary() {
+    const profileId = Number(document.getElementById('ipProfileId')?.value || 0);
+    if (!profileId) { resetIPVisualLibrary(); return; }
+    setIPVisualLibraryStatus('正在读取视觉设定和素材…', 'info');
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/profiles/${profileId}/visual-library`);
+        ipVisualLibrary = result;
+        const kit = result.visual_kit || {};
+        const values = {
+            ipKitCharacterName: kit.character_name || '',
+            ipKitCharacterDescription: kit.character_description || '',
+            ipKitSignatureElements: kit.signature_elements || '',
+            ipKitStyleKeywords: kit.style_keywords || '',
+            ipKitNegativePrompt: kit.negative_prompt || '',
+            ipKitCoverRules: kit.cover_rules || '',
+            ipKitInlineRules: kit.inline_rules || '',
+            ipKitPromptTemplate: kit.prompt_template || ''
+        };
+        Object.entries(values).forEach(([id, value]) => { const element = document.getElementById(id); if (element) element.value = value; });
+        renderIPVisualAssetTypeOptions();
+        renderIPVisualAssetGrid();
+        const badge = document.getElementById('ipVisualFingerprintBadge');
+        const primaryCount = (result.assets || []).filter(item => item.is_primary).length;
+        if (badge) badge.textContent = `${kit.id ? '视觉指纹已启用' : '待保存视觉指纹'} · ${primaryCount ? '主参考已设' : '未设主参考'}`;
+        setIPVisualLibraryStatus(`已载入 ${(result.assets || []).length} 张素材。生成项目配图时会自动使用当前视觉设定与素材标签。`, 'success');
+    } catch (error) {
+        setIPVisualLibraryStatus(error.message || '视觉素材库加载失败', 'danger');
+    }
+}
+
+function renderIPVisualAssetGrid() {
+    revokeIPVisualLibraryUrls();
+    const grid = document.getElementById('ipVisualAssetGrid');
+    if (!grid) return;
+    const assets = ipVisualLibrary.assets || [];
+    const count = document.getElementById('ipVisualAssetCount');
+    if (count) count.textContent = `${assets.length} 张`;
+    if (!assets.length) {
+        grid.innerHTML = '<div class="text-muted small">还没有素材。建议先上传人物定妆图、常用服装和一张风格参考。</div>';
+        return;
+    }
+    grid.innerHTML = assets.map(asset => `
+      <div class="col-6 col-md-4 col-xl-3">
+        <div class="card h-100 ${asset.is_primary ? 'border-primary border-2' : ''}">
+          <div class="ratio ratio-1x1 bg-light overflow-hidden rounded-top d-flex align-items-center justify-content-center" id="ipLibraryAssetImage-${Number(asset.id)}"><span class="spinner-border spinner-border-sm text-primary"></span></div>
+          <div class="card-body p-3">
+            <div class="d-flex justify-content-between gap-2 align-items-start">
+              <div class="fw-semibold text-break">${escapeHtml(asset.name || '视觉素材')}</div>
+              ${asset.is_primary ? '<span class="badge text-bg-primary">主参考</span>' : asset.is_favorite ? '<i class="bi bi-star-fill text-warning" title="已收藏"></i>' : ''}
+            </div>
+            <div class="text-muted small mt-1">${escapeHtml(asset.asset_type_label || asset.asset_type || '')} · ${Number(asset.width || 0)}×${Number(asset.height || 0)}</div>
+            <div class="small mt-2 text-truncate" title="${escapeHtml((asset.tags || []).join(', '))}">${escapeHtml((asset.tags || []).join(' · ') || '暂无标签')}</div>
+          </div>
+          <div class="card-footer bg-transparent p-2 d-flex flex-wrap gap-1">
+            <button class="btn btn-sm ${asset.is_primary ? 'btn-primary' : 'btn-outline-primary'}" type="button" onclick="setIPVisualAssetPrimary(${Number(asset.id)}, ${asset.is_primary ? 'false' : 'true'})" title="设为主参考"><i class="bi bi-pin-angle"></i></button>
+            <button class="btn btn-sm ${asset.is_favorite ? 'btn-warning' : 'btn-outline-warning'}" type="button" onclick="toggleIPVisualAssetFavorite(${Number(asset.id)}, ${asset.is_favorite ? 'false' : 'true'})" title="收藏"><i class="bi bi-star"></i></button>
+            <button class="btn btn-sm btn-outline-secondary" type="button" onclick="editIPVisualAsset(${Number(asset.id)})" title="编辑"><i class="bi bi-pencil"></i></button>
+            <button class="btn btn-sm btn-outline-danger ms-auto" type="button" onclick="deleteIPVisualAsset(${Number(asset.id)})" title="删除"><i class="bi bi-trash"></i></button>
+          </div>
+        </div>
+      </div>`).join('');
+    assets.forEach(loadIPVisualLibraryBlob);
+}
+
+async function loadIPVisualLibraryBlob(asset) {
+    try {
+        const response = await fetch(`${apiBase}${asset.url}`, {headers:{'Authorization':`Bearer ${getAuthToken()}`}});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const url = URL.createObjectURL(await response.blob());
+        ipVisualLibraryObjectUrls.push(url);
+        const container = document.getElementById(`ipLibraryAssetImage-${asset.id}`);
+        if (container) container.innerHTML = `<img src="${url}" alt="${escapeHtml(asset.name || '')}" class="w-100 h-100 object-fit-cover">`;
+    } catch (error) {
+        const container = document.getElementById(`ipLibraryAssetImage-${asset.id}`);
+        if (container) container.innerHTML = '<i class="bi bi-image text-muted fs-2"></i>';
+    }
+}
+
+async function saveIPVisualKit() {
+    const profileId = Number(document.getElementById('ipProfileId')?.value || 0);
+    if (!profileId) { showToast('请先保存 IP 档案', 'warning'); return; }
+    const payload = {
+        character_name: document.getElementById('ipKitCharacterName')?.value.trim() || '',
+        character_description: document.getElementById('ipKitCharacterDescription')?.value.trim() || '',
+        signature_elements: document.getElementById('ipKitSignatureElements')?.value.trim() || '',
+        style_keywords: document.getElementById('ipKitStyleKeywords')?.value.trim() || '',
+        negative_prompt: document.getElementById('ipKitNegativePrompt')?.value.trim() || '',
+        cover_rules: document.getElementById('ipKitCoverRules')?.value.trim() || '',
+        inline_rules: document.getElementById('ipKitInlineRules')?.value.trim() || '',
+        prompt_template: document.getElementById('ipKitPromptTemplate')?.value.trim() || '',
+        aspect_ratios: {cover:'1:1', inline:'4:3'}
+    };
+    try {
+        await requestItemPublishJson(`/ip-content-studio/profiles/${profileId}/visual-kit`, {
+            method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+        });
+        await loadIPVisualLibrary();
+        showToast('视觉 IP 指纹已保存，后续生图会自动沿用', 'success');
+    } catch (error) { showToast(error.message || '视觉设定保存失败', 'danger'); }
+}
+
+async function uploadIPVisualAssets() {
+    const profileId = Number(document.getElementById('ipProfileId')?.value || 0);
+    const files = [...(document.getElementById('ipVisualUploadFiles')?.files || [])];
+    if (!profileId) { showToast('请先保存 IP 档案', 'warning'); return; }
+    if (!files.length) { showToast('请选择一张或多张参考图', 'warning'); return; }
+    const form = new FormData();
+    files.forEach(file => form.append('files', file));
+    form.append('asset_type', document.getElementById('ipVisualUploadType')?.value || 'style_reference');
+    form.append('name', document.getElementById('ipVisualUploadName')?.value.trim() || '');
+    form.append('tags', document.getElementById('ipVisualUploadTags')?.value.trim() || '');
+    form.append('notes', document.getElementById('ipVisualUploadNotes')?.value.trim() || '');
+    setIPVisualLibraryStatus(`正在处理 ${files.length} 张参考图…`, 'info');
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/profiles/${profileId}/visual-assets/upload`, {method:'POST', body:form});
+        document.getElementById('ipVisualUploadFiles').value = '';
+        document.getElementById('ipVisualUploadName').value = '';
+        await loadIPVisualLibrary();
+        showToast(result.message || '视觉素材已加入', 'success');
+    } catch (error) { setIPVisualLibraryStatus(error.message || '视觉素材上传失败', 'danger'); showToast(error.message || '视觉素材上传失败', 'danger'); }
+}
+
+async function generateIPVisualAsset() {
+    const profileId = Number(document.getElementById('ipProfileId')?.value || 0);
+    const prompt = document.getElementById('ipVisualGeneratePrompt')?.value.trim() || '';
+    if (!profileId) { showToast('请先保存 IP 档案', 'warning'); return; }
+    if (prompt.length < 8) { showToast('请写清本次想生成的画面', 'warning'); return; }
+    const button = document.getElementById('ipVisualGenerateBtn');
+    const original = button?.innerHTML || '';
+    if (button) { button.disabled = true; button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>生成中…'; }
+    setIPVisualLibraryStatus('正在套用人物、品牌色和构图规则生成新素材…', 'info');
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/profiles/${profileId}/visual-assets/generate`, {
+            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+                prompt,
+                name:document.getElementById('ipVisualGenerateName')?.value.trim() || null,
+                asset_type:document.getElementById('ipVisualGenerateType')?.value || 'generated',
+                purpose:document.getElementById('ipVisualGeneratePurpose')?.value || 'inline',
+                tags:[]
+            })
+        });
+        await loadIPVisualLibrary();
+        showToast(result.message || '新素材已生成', 'success');
+        if (result.warning) {
+            setIPVisualLibraryStatus(result.warning, 'warning');
+            showToast(result.warning, 'warning');
+        }
+    } catch (error) { setIPVisualLibraryStatus(error.message || '视觉素材生成失败', 'danger'); showToast(error.message || '视觉素材生成失败', 'danger'); }
+    finally { if (button) { button.disabled = false; button.innerHTML = original || '<i class="bi bi-stars me-1"></i>生成并收藏'; } }
+}
+
+async function updateIPVisualAsset(assetId, payload, successMessage) {
+    try {
+        await requestItemPublishJson(`/ip-content-studio/visual-assets/${assetId}`, {
+            method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+        });
+        await loadIPVisualLibrary();
+        if (successMessage) showToast(successMessage, 'success');
+    } catch (error) { showToast(error.message || '视觉素材更新失败', 'danger'); }
+}
+
+async function setIPVisualAssetPrimary(assetId, value) {
+    await updateIPVisualAsset(assetId, {is_primary:Boolean(value)}, value ? '已设为主参考图' : '已取消主参考');
+}
+
+async function toggleIPVisualAssetFavorite(assetId, value) {
+    await updateIPVisualAsset(assetId, {is_favorite:Boolean(value)}, value ? '已收藏素材' : '已取消收藏');
+}
+
+async function editIPVisualAsset(assetId) {
+    const asset = (ipVisualLibrary.assets || []).find(item => Number(item.id) === Number(assetId));
+    if (!asset) return;
+    const name = window.prompt('素材名称', asset.name || '');
+    if (name === null) return;
+    const tags = window.prompt('标签（逗号分隔）', (asset.tags || []).join(', '));
+    if (tags === null) return;
+    const notes = window.prompt('连续性说明', asset.notes || '');
+    if (notes === null) return;
+    await updateIPVisualAsset(assetId, {name, tags:ipLines(tags), notes}, '素材信息已更新');
+}
+
+async function deleteIPVisualAsset(assetId) {
+    if (!confirm('确定从视觉素材库删除这张图吗？项目里的原图不受影响。')) return;
+    try {
+        await requestItemPublishJson(`/ip-content-studio/visual-assets/${assetId}`, {method:'DELETE'});
+        await loadIPVisualLibrary();
+        showToast('视觉素材已删除', 'success');
+    } catch (error) { showToast(error.message || '视觉素材删除失败', 'danger'); }
+}
+
+async function loadIPSourceImport() {
+    const id = Number(document.getElementById('ipSourceImport')?.value || 0);
+    ipSourceImages = [];
+    if (!id) return;
+    try {
+        const result = await requestItemPublishJson(`/content-products/browser-imports/${id}`);
+        const item = result.item || {};
+        document.getElementById('ipSourceUrl').value = item.source_url || '';
+        document.getElementById('ipSourceTitle').value = item.source_title || '';
+        document.getElementById('ipSourceAuthor').value = item.author || '';
+        document.getElementById('ipSourceText').value = item.source_text || '';
+        ipSourceImages = item.images || [];
+        setIPStudioStatus(`已载入 Chrome 采集：${String(item.source_text || '').length} 字、${ipSourceImages.length} 张来源图；来源图不会直接进入发布稿。`, 'info');
+    } catch (error) {
+        showToast(error.message || 'Chrome 采集载入失败', 'danger');
+    }
+}
+
+async function analyzeIPSource() {
+    if (ipStudioBusy) return;
+    const profileId = Number(document.getElementById('ipProfileId')?.value || 0);
+    const sourceText = document.getElementById('ipSourceText')?.value.trim() || '';
+    const sourceUrl = document.getElementById('ipSourceUrl')?.value.trim() || '';
+    if (!profileId) { showToast('请先保存并选择一个 IP 档案', 'warning'); return; }
+    if (!sourceUrl && sourceText.length < 80) { showToast('请选择 Chrome 采集，或提供至少 80 个字的正文', 'warning'); return; }
+    const button = document.getElementById('ipAnalyzeBtn');
+    const original = button?.innerHTML || '';
+    ipStudioBusy = true;
+    if (button) { button.disabled = true; button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>分析中...'; }
+    setIPStudioStatus('正在拆分知识、原作者身份、宣传内容和平台噪音...', 'info');
+    try {
+        const result = await requestItemPublishJson('/ip-content-studio/projects/analyze', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+                profile_id: profileId,
+                browser_import_id: Number(document.getElementById('ipSourceImport')?.value || 0) || null,
+                source_url: sourceUrl || null,
+                source_title: document.getElementById('ipSourceTitle')?.value.trim() || null,
+                source_author: document.getElementById('ipSourceAuthor')?.value.trim() || null,
+                source_text: sourceText || null,
+                source_images: ipSourceImages
+            })
+        });
+        ipCurrentProject = result.project;
+        renderIPAnalysis(ipCurrentProject);
+        await loadIPProjects();
+        setIPStudioStatus('分析完成。请核对保留知识和排除内容，再选择创作角度。', 'success');
+    } catch (error) {
+        setIPStudioStatus(error.message || '来源分析失败', 'danger');
+        showToast(error.message || '来源分析失败', 'danger');
+    } finally {
+        ipStudioBusy = false;
+        if (button) { button.disabled = false; button.innerHTML = original || '<i class="bi bi-diagram-3 me-1"></i>拆解知识与污染内容'; }
+    }
+}
+
+function renderIPAnalysis(project) {
+    const analysis = project?.analysis || {};
+    document.getElementById('ipAnalysisCard')?.classList.remove('d-none');
+    const knowledge = document.getElementById('ipAnalysisKnowledge');
+    if (knowledge) knowledge.textContent = [analysis.core_thesis ? `核心命题：${analysis.core_thesis}` : '', analysis.clean_knowledge || ''].filter(Boolean).join('\n\n');
+    const excluded = document.getElementById('ipAnalysisExcluded');
+    if (excluded) excluded.innerHTML = (analysis.excluded_sections || []).length ? `<ul class="mb-0 ps-3">${(analysis.excluded_sections || []).map(item => `<li class="mb-2"><div>${escapeHtml(item.text || String(item))}</div><span class="text-muted">${escapeHtml(item.reason || '已排除')}</span></li>`).join('')}</ul>` : '<span class="text-muted">未识别到明显污染段落</span>';
+    const badge = document.getElementById('ipAnalysisCleanBadge');
+    if (badge) badge.textContent = `已隔离 ${(analysis.excluded_sections || []).length} 段`;
+    const angleSelect = document.getElementById('ipCreativeAngle');
+    const suggested = analysis.suggested_angles || [];
+    if (angleSelect && suggested.length) {
+        const suggestedKey = suggested[0]?.key;
+        if ([...angleSelect.options].some(option => option.value === suggestedKey)) angleSelect.value = suggestedKey;
+    }
+    document.getElementById('ipAnalysisCard')?.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+async function generateIPProject() {
+    if (ipStudioBusy || !ipCurrentProject?.id) return;
+    const platforms = [...document.querySelectorAll('.ip-platform-check:checked')].map(item => item.value);
+    if (!platforms.length) { showToast('请至少选择一个发布平台', 'warning'); return; }
+    const button = document.getElementById('ipGenerateBtn');
+    const original = button?.innerHTML || '';
+    ipStudioBusy = true;
+    if (button) { button.disabled = true; button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>创作中...'; }
+    setIPStudioStatus('正在用你的 IP 档案重构文章，并生成多平台版本和新配图...', 'info');
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/projects/${ipCurrentProject.id}/generate`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+                angle: document.getElementById('ipCreativeAngle')?.value || 'recent_learning',
+                custom_direction: document.getElementById('ipCustomDirection')?.value.trim() || null,
+                platforms,
+                generate_images: Boolean(document.getElementById('ipGenerateImages')?.checked),
+                image_count: Number(document.getElementById('ipImageCount')?.value || 0)
+            })
+        });
+        ipCurrentProject = result.project;
+        renderIPProjectEditor(ipCurrentProject);
+        await loadIPProjects();
+        setIPStudioStatus('生成完成。请检查待确认事实、原创度和平台版本，修改后再导出。', ipCurrentProject.quality?.passed ? 'success' : 'warning');
+    } catch (error) {
+        setIPStudioStatus(error.message || 'IP 内容生成失败', 'danger');
+        showToast(error.message || 'IP 内容生成失败', 'danger');
+    } finally {
+        ipStudioBusy = false;
+        if (button) { button.disabled = false; button.innerHTML = original || '<i class="bi bi-stars me-1"></i>生成母稿与变体'; }
+    }
+}
+
+function renderIPProjectEditor(project) {
+    if (!project) return;
+    ipCurrentProject = project;
+    document.getElementById('ipEditorCard')?.classList.remove('d-none');
+    document.getElementById('ipMasterTitle').value = project.title || '';
+    document.getElementById('ipMasterSummary').value = project.summary || '';
+    document.getElementById('ipMasterMarkdown').value = project.master_markdown || '';
+    const quality = project.quality || {};
+    const summary = document.getElementById('ipQualitySummary');
+    if (summary) summary.innerHTML = `原创度 <strong>${Number(quality.originality_score || 0)}</strong>/100 · 全文相似度 ${Math.round(Number(quality.whole_text_similarity || 0) * 100)}% · 身份污染 ${Number((quality.source_identity_contamination || []).length)} 处 ${quality.passed ? '<span class="text-success">已通过</span>' : '<span class="text-warning">建议复核</span>'}`;
+    const confirmations = quality.confirmation_items || [];
+    const confirmationElement = document.getElementById('ipConfirmationItems');
+    if (confirmationElement) confirmationElement.innerHTML = confirmations.length ? `<ul class="ps-3 mb-0">${confirmations.map(item => `<li>${escapeHtml(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>` : '<span class="text-success">没有模型标记的待确认项</span>';
+    const variantSelect = document.getElementById('ipVariantSelect');
+    const variants = project.variants || {};
+    if (variantSelect) {
+        variantSelect.innerHTML = Object.keys(variants).map(key => `<option value="${escapeHtml(key)}">${escapeHtml((ipStudioMeta.platforms || []).find(item => item.key === key)?.label || key)}</option>`).join('');
+        showIPVariant();
+    }
+    renderIPVisuals(project.visuals || []);
+    const exportMenu = document.getElementById('ipExportMenu');
+    if (exportMenu) exportMenu.innerHTML = Object.entries({zip:'完整 ZIP', markdown:'Markdown', html:'公众号 HTML', docx:'DOCX', pdf:'PDF'}).map(([key, label]) => `<li><button class="dropdown-item" type="button" onclick="downloadIPExport('${key}')">${label}</button></li>`).join('');
+    document.getElementById('ipEditorCard')?.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function showIPVariant() {
+    const key = document.getElementById('ipVariantSelect')?.value;
+    const preview = document.getElementById('ipVariantPreview');
+    if (!preview) return;
+    const value = ipCurrentProject?.variants?.[key];
+    preview.value = typeof value === 'string' ? value : JSON.stringify(value || {}, null, 2);
+    preview.oninput = updateIPVariantDraft;
+}
+
+function updateIPVariantDraft() {
+    const key = document.getElementById('ipVariantSelect')?.value;
+    if (!key || !ipCurrentProject) return;
+    const text = document.getElementById('ipVariantPreview')?.value || '';
+    try { ipCurrentProject.variants[key] = JSON.parse(text); } catch { ipCurrentProject.variants[key] = text; }
+}
+
+function revokeIPVisualUrls() {
+    ipVisualObjectUrls.forEach(url => URL.revokeObjectURL(url));
+    ipVisualObjectUrls = [];
+}
+
+function renderIPVisuals(visuals) {
+    revokeIPVisualUrls();
+    const gallery = document.getElementById('ipVisualGallery');
+    if (!gallery) return;
+    if (!visuals.length) { gallery.innerHTML = '<div class="text-muted small">暂无配图方案</div>'; return; }
+    gallery.innerHTML = visuals.map(item => `<div class="col-sm-6 col-xl-4"><div class="card h-100"><div class="ratio ratio-1x1 bg-light rounded-top d-flex align-items-center justify-content-center overflow-hidden" id="ipVisualImage-${escapeHtml(item.id)}">${item.status === 'ready' ? '<span class="spinner-border spinner-border-sm text-primary"></span>' : `<div class="text-center p-3"><i class="bi bi-image fs-2"></i><div class="small mt-2">${escapeHtml(item.status === 'failed' ? '生图失败，提示词已保留' : '配图方案')}</div></div>`}</div><div class="card-body"><div class="fw-semibold">${escapeHtml(item.alt || item.section_title || item.slot || '配图')}</div><div class="text-muted small mt-1" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden">${escapeHtml(item.prompt || '')}</div><textarea class="form-control form-control-sm mt-2" id="ipVisualSuggestion-${escapeHtml(item.id)}" rows="2" placeholder="补充建议：更有冲击力、换成真人摄影感……"></textarea><button class="btn btn-sm btn-outline-primary w-100 mt-2" onclick="regenerateIPVisual('${escapeHtml(item.id)}')"><i class="bi bi-arrow-repeat me-1"></i>按建议重生成</button>${item.status === 'ready' ? `<button class="btn btn-sm btn-outline-warning w-100 mt-2" onclick="saveIPProjectVisualToLibrary('${escapeHtml(item.id)}')"><i class="bi bi-star me-1"></i>收藏到视觉素材库</button>` : ''}</div></div></div>`).join('');
+    visuals.filter(item => item.status === 'ready' && item.url).forEach(loadIPVisualBlob);
+}
+
+async function loadIPVisualBlob(item) {
+    try {
+        const response = await fetch(`${apiBase}${item.url}`, {headers:{'Authorization':`Bearer ${getAuthToken()}`}});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const url = URL.createObjectURL(await response.blob());
+        ipVisualObjectUrls.push(url);
+        const container = document.getElementById(`ipVisualImage-${item.id}`);
+        if (container) container.innerHTML = `<img src="${url}" alt="${escapeHtml(item.alt || '')}" class="w-100 h-100 object-fit-cover">`;
+    } catch (error) {
+        console.warn('IP 配图预览加载失败:', error);
+    }
+}
+
+async function regenerateIPVisual(visualId) {
+    if (!ipCurrentProject?.id || ipStudioBusy) return;
+    const suggestion = document.getElementById(`ipVisualSuggestion-${visualId}`)?.value.trim() || '';
+    ipStudioBusy = true;
+    setIPStudioStatus('正在按你的建议重新生成配图...', 'info');
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/projects/${ipCurrentProject.id}/visuals/${encodeURIComponent(visualId)}/regenerate`, {
+            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({suggestion})
+        });
+        ipCurrentProject = result.project;
+        renderIPVisuals(ipCurrentProject.visuals || []);
+        setIPStudioStatus('配图已重新生成并替换到导出文档。', 'success');
+    } catch (error) {
+        showToast(error.message || '配图重生成失败', 'danger');
+        setIPStudioStatus(error.message || '配图重生成失败', 'danger');
+    } finally { ipStudioBusy = false; }
+}
+
+async function saveIPProjectVisualToLibrary(visualId) {
+    if (!ipCurrentProject?.id) return;
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/projects/${ipCurrentProject.id}/visuals/${encodeURIComponent(visualId)}/save-to-library`, {method:'POST'});
+        await loadIPVisualLibrary();
+        showToast(result.message || '项目配图已收藏', 'success');
+    } catch (error) { showToast(error.message || '项目配图收藏失败', 'danger'); }
+}
+
+async function saveIPProject() {
+    if (!ipCurrentProject?.id) return;
+    updateIPVariantDraft();
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/projects/${ipCurrentProject.id}`, {
+            method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+                title:document.getElementById('ipMasterTitle')?.value.trim() || '',
+                summary:document.getElementById('ipMasterSummary')?.value.trim() || '',
+                master_markdown:document.getElementById('ipMasterMarkdown')?.value || '',
+                variants:ipCurrentProject.variants || {}
+            })
+        });
+        ipCurrentProject = result.project;
+        renderIPProjectEditor(ipCurrentProject);
+        await loadIPProjects();
+        showToast('母稿、平台版本和导出文件已更新', 'success');
+    } catch (error) { showToast(error.message || '项目保存失败', 'danger'); }
+}
+
+async function copyIPMaster() {
+    try { await navigator.clipboard.writeText(document.getElementById('ipMasterMarkdown')?.value || ''); showToast('公众号母稿已复制', 'success'); }
+    catch { showToast('复制失败，请在编辑框中全选复制', 'warning'); }
+}
+
+async function downloadIPExport(format) {
+    if (!ipCurrentProject?.id) return;
+    try {
+        const response = await fetch(`${apiBase}/ip-content-studio/projects/${ipCurrentProject.id}/download?format=${encodeURIComponent(format)}`, {headers:{'Authorization':`Bearer ${getAuthToken()}`}});
+        if (!response.ok) {
+            const text = await response.text();
+            try { throw new Error(JSON.parse(text).detail || text); } catch (error) { if (error instanceof SyntaxError) throw new Error(text); throw error; }
+        }
+        const blob = await response.blob();
+        const suffix = format === 'markdown' ? 'md' : format;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a'); link.href = url; link.download = `ip-content-${ipCurrentProject.id}.${suffix}`; document.body.appendChild(link); link.click(); link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        showToast(`${format.toUpperCase()} 导出已开始`, 'success');
+    } catch (error) { showToast(error.message || '导出失败', 'danger'); }
+}
+
+async function loadIPProjects() {
+    const container = document.getElementById('ipProjectList');
+    if (!container) return;
+    try {
+        const result = await requestItemPublishJson('/ip-content-studio/projects?page=1&page_size=50');
+        const items = result.items || [];
+        if (!items.length) { container.innerHTML = '<div class="text-muted small">暂无项目</div>'; return; }
+        const labels = {draft:'草稿', analyzing:'分析中', analyzed:'待选角度', generating:'生成中', ready:'可发布', review_required:'待复核', failed:'失败'};
+        container.innerHTML = `<table class="table table-hover align-middle"><thead><tr><th>来源</th><th>母稿标题</th><th>状态</th><th>原创度</th><th>更新时间</th><th>操作</th></tr></thead><tbody>${items.map(item => `<tr><td><div class="fw-semibold">${escapeHtml(item.source_title || '未命名来源')}</div><div class="text-muted small text-truncate" style="max-width:240px">${escapeHtml(item.source_url || '粘贴正文')}</div></td><td>${escapeHtml(item.title || '-')}</td><td><span class="badge text-bg-${item.status === 'failed' ? 'danger' : item.status === 'review_required' ? 'warning' : 'success'}">${escapeHtml(labels[item.status] || item.status || '-')}</span></td><td>${item.quality?.originality_score != null ? Number(item.quality.originality_score) : '-'}</td><td class="small">${escapeHtml(item.updated_at || '-')}</td><td class="text-nowrap"><button class="btn btn-sm btn-outline-primary me-1" onclick="openIPProject(${Number(item.id)})"><i class="bi bi-pencil-square"></i></button><button class="btn btn-sm btn-outline-danger" onclick="deleteIPProject(${Number(item.id)})"><i class="bi bi-trash"></i></button></td></tr>`).join('')}</tbody></table>`;
+    } catch (error) { container.innerHTML = `<div class="text-danger small">${escapeHtml(error.message || '项目加载失败')}</div>`; }
+}
+
+async function openIPProject(projectId) {
+    try {
+        const result = await requestItemPublishJson(`/ip-content-studio/projects/${projectId}`);
+        ipCurrentProject = result.project;
+        const profileId = Number(ipCurrentProject.profile_id || 0);
+        if (profileId) { document.getElementById('ipProfileSelect').value = String(profileId); selectIPProfile(); }
+        document.getElementById('ipSourceUrl').value = ipCurrentProject.source_url || '';
+        document.getElementById('ipSourceTitle').value = ipCurrentProject.source_title || '';
+        document.getElementById('ipSourceAuthor').value = ipCurrentProject.source_author || '';
+        document.getElementById('ipSourceText').value = ipCurrentProject.source_text || '';
+        renderIPAnalysis(ipCurrentProject);
+        if (ipCurrentProject.master_markdown) renderIPProjectEditor(ipCurrentProject);
+    } catch (error) { showToast(error.message || '项目打开失败', 'danger'); }
+}
+
+async function deleteIPProject(projectId) {
+    if (!confirm('确定删除这个创作项目及全部本地导出和配图吗？')) return;
+    try {
+        await requestItemPublishJson(`/ip-content-studio/projects/${projectId}`, {method:'DELETE'});
+        if (Number(ipCurrentProject?.id) === Number(projectId)) {
+            ipCurrentProject = null;
+            document.getElementById('ipAnalysisCard')?.classList.add('d-none');
+            document.getElementById('ipEditorCard')?.classList.add('d-none');
+        }
+        await loadIPProjects();
+        showToast('创作项目已删除', 'success');
+    } catch (error) { showToast(error.message || '项目删除失败', 'danger'); }
 }
 
 function ensureQuarkFolderPickerModal() {

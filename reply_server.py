@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, Response, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -59,6 +60,22 @@ from utils.content_productizer import (
     validate_source_url,
     write_product_package,
 )
+from utils.ip_content_studio import (
+    ANGLE_LABELS,
+    PLATFORM_LABELS,
+    assess_originality,
+    build_analysis_prompts,
+    build_generation_prompts,
+    build_visual_identity_prompt,
+    compose_master_with_visuals,
+    normalize_analysis,
+    normalize_generation,
+    preclean_source_text,
+    remove_project_package,
+    save_visual_asset,
+    write_project_package,
+)
+from utils.feishu_document import FeishuDocumentClient, FeishuDocumentError
 from utils.time_utils import (
     LOCAL_TIMEZONE,
     get_local_now,
@@ -1208,6 +1225,17 @@ app = FastAPI(
     description="闲鱼管理系统API",
     docs_url="/docs",
     redoc_url="/redoc"
+)
+
+# The unpacked Chrome extension receives a generated extension id, so its
+# origin cannot be listed statically.  The capture endpoint is additionally
+# protected by a per-user encrypted pairing token.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
+    allow_credentials=False,
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Content-Import-Token"],
 )
 
 # 注册刮刮乐远程控制路由
@@ -10290,7 +10318,10 @@ class ContentProductGenerateRequest(BaseModel):
     """Create a sellable document/Skill package from a source link or pasted text."""
     source_url: Optional[str] = None
     source_text: Optional[str] = None
+    browser_import_id: Optional[int] = None
+    reference_images: List[Dict[str, Any]] = []
     output_mode: str = "bundle"  # document / skill / bundle
+    output_formats: List[str] = []  # markdown / feishu / pdf / skill
     rights_status: str = "reference_only"  # self_owned / licensed / public_domain / reference_only
     category_hint: Optional[str] = None
     market_query: Optional[str] = None
@@ -10301,6 +10332,28 @@ class ContentProductGenerateRequest(BaseModel):
     account_id: Optional[str] = None
     publish_after_review: bool = False
     delivery_text: Optional[str] = None
+    upload_to_quark: bool = False
+    quark_parent_fid: Optional[str] = None
+    quark_artifact: str = "pdf"  # pdf / zip
+
+
+class ContentBrowserImportRequest(BaseModel):
+    source_url: str
+    source_title: Optional[str] = None
+    source_text: str
+    author: Optional[str] = None
+    posts: List[Dict[str, Any]] = []
+    images: List[Dict[str, Any]] = []
+    structured_blocks: List[Dict[str, Any]] = []
+    page_language: Optional[str] = None
+    captured_at: Optional[str] = None
+
+
+class ContentProductSettingsRequest(BaseModel):
+    feishu_app_id: Optional[str] = None
+    feishu_app_secret: Optional[str] = None
+    feishu_folder_token: Optional[str] = None
+    quark_parent_fid: Optional[str] = None
 
 
 class ContentProductUpdateRequest(BaseModel):
@@ -10312,6 +10365,106 @@ class ContentProductUpdateRequest(BaseModel):
     rights_status: Optional[str] = None
     output_mode: Optional[str] = None
     delivery_text: Optional[str] = None
+
+
+class IPProfileRequest(BaseModel):
+    name: str
+    display_name: Optional[str] = None
+    positioning: Optional[str] = None
+    audience: Optional[str] = None
+    topics: List[str] = []
+    tone: Optional[str] = None
+    opening_template: Optional[str] = None
+    closing_template: Optional[str] = None
+    bio: Optional[str] = None
+    experiences: List[str] = []
+    forbidden_phrases: List[str] = []
+    visual_style: Optional[str] = None
+    brand_colors: List[str] = []
+    reference_images: List[Dict[str, Any]] = []
+    platform_bios: Dict[str, str] = {}
+    is_default: bool = False
+
+
+class IPProfileUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    display_name: Optional[str] = None
+    positioning: Optional[str] = None
+    audience: Optional[str] = None
+    topics: Optional[List[str]] = None
+    tone: Optional[str] = None
+    opening_template: Optional[str] = None
+    closing_template: Optional[str] = None
+    bio: Optional[str] = None
+    experiences: Optional[List[str]] = None
+    forbidden_phrases: Optional[List[str]] = None
+    visual_style: Optional[str] = None
+    brand_colors: Optional[List[str]] = None
+    reference_images: Optional[List[Dict[str, Any]]] = None
+    platform_bios: Optional[Dict[str, str]] = None
+    is_default: Optional[bool] = None
+
+
+class IPProjectAnalyzeRequest(BaseModel):
+    profile_id: int
+    browser_import_id: Optional[int] = None
+    source_url: Optional[str] = None
+    source_title: Optional[str] = None
+    source_author: Optional[str] = None
+    source_text: Optional[str] = None
+    source_images: List[Dict[str, Any]] = []
+
+
+class IPProjectGenerateRequest(BaseModel):
+    angle: str = "recent_learning"
+    custom_direction: Optional[str] = None
+    platforms: List[str] = ["wechat", "xiaohongshu", "douyin", "x"]
+    generate_images: bool = True
+    image_count: int = 4
+
+
+class IPProjectUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    master_markdown: Optional[str] = None
+    variants: Optional[Dict[str, Any]] = None
+    brief: Optional[Dict[str, Any]] = None
+
+
+class IPVisualRegenerateRequest(BaseModel):
+    suggestion: Optional[str] = None
+    prompt: Optional[str] = None
+
+
+class IPVisualKitRequest(BaseModel):
+    character_name: Optional[str] = None
+    character_description: Optional[str] = None
+    signature_elements: Optional[str] = None
+    style_keywords: Optional[str] = None
+    negative_prompt: Optional[str] = None
+    cover_rules: Optional[str] = None
+    inline_rules: Optional[str] = None
+    prompt_template: Optional[str] = None
+    aspect_ratios: Dict[str, str] = {}
+
+
+class IPVisualAssetUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    asset_type: Optional[str] = None
+    tags: Optional[List[str]] = None
+    notes: Optional[str] = None
+    prompt: Optional[str] = None
+    is_primary: Optional[bool] = None
+    is_favorite: Optional[bool] = None
+
+
+class IPVisualAssetGenerateRequest(BaseModel):
+    prompt: str
+    name: Optional[str] = None
+    asset_type: str = "style_reference"
+    tags: List[str] = []
+    notes: Optional[str] = None
+    purpose: str = "inline"
 
 
 def _parse_optional_non_negative_float(value: Any, field_label: str) -> Optional[float]:
@@ -10912,7 +11065,7 @@ def _validate_ai_product_creator_ready(settings: Dict[str, Any]) -> None:
         )
 
 
-AI_PRODUCT_MAX_REFERENCE_IMAGES = 4
+AI_PRODUCT_MAX_REFERENCE_IMAGES = 8
 AI_PRODUCT_MAX_REFERENCE_BYTES = 8 * 1024 * 1024
 
 
@@ -10961,6 +11114,9 @@ def _normalize_ai_product_reference_images(images: List[Any]) -> List[Dict[str, 
             'size': len(jpeg_bytes),
             'width': width,
             'height': height,
+            'alt': str(image.get('alt') or '')[:240],
+            'source_url': str(image.get('source_url') or image.get('url') or '')[:2000],
+            'role': str(image.get('role') or '')[:30],
         })
     return normalized
 
@@ -11807,8 +11963,11 @@ async def generate_ai_product_material(
     brief = str(request.description or '').strip()
     if len(brief) < 4:
         raise HTTPException(status_code=400, detail='请至少用 4 个字描述要上架的商品')
-    if len(brief) > 5000:
-        raise HTTPException(status_code=400, detail='商品需求描述最多 5000 字')
+    # The link-to-product flow may pass a long article excerpt so the listing
+    # copy can reflect the actual contents instead of only its first few lines.
+    # The normal manual form still remains comfortably below this limit.
+    if len(brief) > 12000:
+        raise HTTPException(status_code=400, detail='商品需求描述最多 12000 字')
 
     settings = _normalize_quark_catalog_settings(
         db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
@@ -12056,6 +12215,104 @@ def _upsert_content_delivery_assets(
     return {'card_id': int(card_id), 'rule_id': int(rule_id)}
 
 
+def _content_import_token_user(token: str) -> Optional[int]:
+    clean = str(token or '').strip()
+    match = re.fullmatch(r'xcp_(\d+)_([A-Za-z0-9_-]{24,})', clean)
+    if not match:
+        return None
+    user_id = int(match.group(1))
+    settings = db_manager.get_content_product_settings(user_id, include_secrets=True)
+    expected = str(settings.get('chrome_import_token') or '')
+    return user_id if expected and secrets.compare_digest(clean, expected) else None
+
+
+@app.get('/content-products/settings')
+def get_content_product_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
+    settings = db_manager.get_content_product_settings(current_user['user_id'], include_secrets=False)
+    return {'success': True, 'settings': settings}
+
+
+@app.put('/content-products/settings')
+def save_content_product_settings(
+    request: ContentProductSettingsRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    if not db_manager.save_content_product_settings(
+        current_user['user_id'], request.model_dump(exclude_unset=True)
+    ):
+        raise HTTPException(status_code=500, detail='保存内容商品化配置失败')
+    return {
+        'success': True,
+        'message': '内容商品化配置已加密保存',
+        'settings': db_manager.get_content_product_settings(current_user['user_id'], include_secrets=False),
+    }
+
+
+@app.post('/content-products/import-token')
+def create_content_import_token(current_user: Dict[str, Any] = Depends(get_current_user)):
+    token = f"xcp_{int(current_user['user_id'])}_{secrets.token_urlsafe(30)}"
+    if not db_manager.save_content_product_settings(
+        current_user['user_id'], {'chrome_import_token': token}
+    ):
+        raise HTTPException(status_code=500, detail='生成 Chrome 扩展配对码失败')
+    return {
+        'success': True,
+        'token': token,
+        'extension_path': str((Path(__file__).parent / 'chrome-extension').resolve()),
+    }
+
+
+@app.post('/content-products/browser-import')
+def capture_browser_content(request: ContentBrowserImportRequest, raw_request: Request):
+    user_id = _content_import_token_user(raw_request.headers.get('x-content-import-token', ''))
+    if not user_id:
+        raise HTTPException(status_code=401, detail='扩展配对码已失效，请在链接商品化页面重新生成')
+    source_text = str(request.source_text or '').strip()
+    if len(source_text) < 20:
+        raise HTTPException(status_code=400, detail='采集正文过短，请先展开长文或加载线程')
+    images = _normalize_ai_product_reference_images(request.images or [])
+    import_id = db_manager.add_content_browser_import(user_id, {
+        'source_url': str(request.source_url or '')[:2000],
+        'source_title': str(request.source_title or 'X 长文')[:300],
+        'source_text': source_text[:100000],
+        'author': str(request.author or '')[:120],
+        'images': images,
+        'metadata': {
+            'posts': request.posts[:100],
+            'structured_blocks': request.structured_blocks[:2000],
+            'page_language': request.page_language,
+            'captured_at': request.captured_at,
+        },
+    })
+    if not import_id:
+        raise HTTPException(status_code=500, detail='保存 Chrome 采集内容失败')
+    return {'success': True, 'import_id': import_id, 'image_count': len(images)}
+
+
+@app.get('/content-products/browser-imports')
+def list_browser_imports(current_user: Dict[str, Any] = Depends(get_current_user)):
+    items = db_manager.list_content_browser_imports(current_user['user_id'])
+    for item in items:
+        item['source_text'] = str(item.get('source_text') or '')[:500]
+        item['image_count'] = len(item.pop('images', []) or [])
+    return {'success': True, 'items': items}
+
+
+@app.get('/content-products/browser-imports/{import_id}')
+def get_browser_import(import_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    item = db_manager.get_content_browser_import(import_id, current_user['user_id'])
+    if not item:
+        raise HTTPException(status_code=404, detail='Chrome 采集记录不存在')
+    return {'success': True, 'item': item}
+
+
+@app.delete('/content-products/browser-imports/{import_id}')
+def delete_browser_import(import_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    if not db_manager.delete_content_browser_import(import_id, current_user['user_id']):
+        raise HTTPException(status_code=404, detail='Chrome 采集记录不存在')
+    return {'success': True, 'message': 'Chrome 采集记录已删除'}
+
+
 def _sync_content_product_before_publish(
     *,
     user_id: int,
@@ -12104,15 +12361,39 @@ async def generate_content_product(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Turn a public link or pasted long-form text into an editable listing and export package."""
-    output_mode = str(request.output_mode or 'bundle').strip().lower()
-    if output_mode not in {'document', 'skill', 'bundle'}:
-        raise HTTPException(status_code=400, detail='输出形式请选择 document、skill 或 bundle')
+    requested_formats = {
+        str(item or '').strip().lower() for item in (request.output_formats or []) if str(item or '').strip()
+    }
+    if not requested_formats:
+        output_mode = str(request.output_mode or 'bundle').strip().lower()
+        legacy_formats = {
+            'document': {'markdown'},
+            'skill': {'skill'},
+            'bundle': {'markdown', 'pdf', 'skill'},
+        }
+        if output_mode not in legacy_formats:
+            raise HTTPException(status_code=400, detail='请选择 Markdown、PDF、飞书文档或 Skill')
+        requested_formats = legacy_formats[output_mode]
+    supported_formats = {'markdown', 'pdf', 'feishu', 'skill'}
+    unknown_formats = requested_formats - supported_formats
+    if unknown_formats:
+        raise HTTPException(status_code=400, detail=f"输出形式不受支持：{', '.join(sorted(unknown_formats))}")
+    output_mode = '+'.join(sorted(requested_formats))
     rights_status = str(request.rights_status or 'reference_only').strip().lower()
     if rights_status not in {'self_owned', 'licensed', 'public_domain', 'reference_only'}:
         raise HTTPException(status_code=400, detail='来源状态不受支持')
     if request.publish_after_review and rights_status == 'reference_only':
         raise HTTPException(status_code=400, detail='一键上架前请先确认来源状态，并完成人工复核')
-    source_url = str(request.source_url or '').strip()
+    browser_import = None
+    if request.browser_import_id:
+        browser_import = db_manager.get_content_browser_import(
+            int(request.browser_import_id), current_user['user_id']
+        )
+        if not browser_import:
+            raise HTTPException(status_code=404, detail='所选 Chrome 采集记录不存在')
+    source_url = str((browser_import or {}).get('source_url') or request.source_url or '').strip()
+    source_text = str((browser_import or {}).get('source_text') or request.source_text or '')
+    reference_images = list((browser_import or {}).get('images') or request.reference_images or [])
     if source_url:
         try:
             source_url = validate_source_url(source_url)
@@ -12121,23 +12402,37 @@ async def generate_content_product(
 
     fetched = None
     fetch_warning = ''
-    if source_url:
-        try:
-            fetched = await fetch_content_source(source_url)
-        except ContentProductError as exc:
-            fetch_warning = str(exc)
-            if not str(request.source_text or '').strip():
-                raise HTTPException(status_code=422, detail=f'{fetch_warning}；也可以直接粘贴正文继续') from exc
+    if browser_import:
+        clean_text = str(source_text or '').strip()
+        source = ContentSource(
+            url=source_url,
+            title=str(browser_import.get('source_title') or clean_text.splitlines()[0] or 'X 长文')[:300],
+            text=clean_text[:100000],
+            excerpt=clean_text[:500],
+            fetched=True,
+            blocks=list((browser_import.get('metadata') or {}).get('structured_blocks') or []),
+        )
+    else:
+        if source_url:
+            try:
+                fetched = await fetch_content_source(source_url)
+            except ContentProductError as exc:
+                fetch_warning = str(exc)
+                if not source_text.strip():
+                    raise HTTPException(status_code=422, detail=f'{fetch_warning}；也可以直接粘贴正文继续') from exc
 
-    try:
-        source = merge_source(source_url, str(request.source_text or ''), fetched)
-    except ContentProductError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            source = merge_source(source_url, source_text, fetched)
+        except ContentProductError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Reuse the existing market-aware title/description/cover flow.  The full
-    # source remains in the export; the model receives a bounded excerpt.
+    # source remains in the export; the model receives a generous excerpt only
+    # for writing the editable listing copy.  It must never replace the source
+    # article in the Markdown/PDF/DOCX package.
     ai_request = AIProductCreatorRequest(
-        description=source.text[:5000],
+        description=source.text[:12000],
+        reference_images=reference_images,
         account_id=request.account_id,
         category_hint=request.category_hint,
         market_query=request.market_query or source.title,
@@ -12162,6 +12457,7 @@ async def generate_content_product(
         'suggested_price': material.get('price'),
         'original_price': material.get('original_price'),
         'cover_prompt': '',
+        'images': material.get('images') or [],
     }
     status_value = 'review_required' if rights_status == 'reference_only' else 'ready'
     product_id = db_manager.add_content_product(current_user['user_id'], {
@@ -12180,9 +12476,19 @@ async def generate_content_product(
         'metadata': {
             'fetched': bool(source.fetched),
             'fetch_warning': fetch_warning,
+            'source_text_chars': len(source.text),
+            'source_block_count': len(source.blocks or []),
+            'source_block_text_chars': sum(
+                len(str(item.get('markdown') or item.get('text') or ''))
+                for item in (source.blocks or [])
+                if isinstance(item, dict) and str(item.get('type') or '').lower() not in {'image', 'divider'}
+            ),
+            'full_source_preserved': True,
             'market_research': generated.get('market_research') or {},
             'warnings': generated.get('warnings') or [],
             'delivery_text_provided': bool(str(request.delivery_text or '').strip()),
+            'output_formats': sorted(requested_formats),
+            'browser_import_id': int(request.browser_import_id) if request.browser_import_id else None,
         },
     })
     if not product_id:
@@ -12204,21 +12510,86 @@ async def generate_content_product(
         package_paths = write_product_package(
             package_base, str(product_id),
             source, listing, rights_status=rights_status, output_mode=output_mode,
+            output_formats=sorted(requested_formats),
         )
         db_manager.update_content_product(product_id, current_user['user_id'], {
             'package_dir': package_paths.get('directory'),
             'package_zip': package_paths.get('zip'),
             'status': status_value,
         })
+        integration_metadata: Dict[str, Any] = {}
+        integration_warnings: List[str] = []
+        content_settings = db_manager.get_content_product_settings(
+            current_user['user_id'], include_secrets=True
+        )
+        if 'feishu' in requested_formats:
+            if content_settings.get('feishu_app_id') and content_settings.get('feishu_app_secret'):
+                try:
+                    async with FeishuDocumentClient(
+                        content_settings['feishu_app_id'], content_settings['feishu_app_secret']
+                    ) as feishu_client:
+                        integration_metadata['feishu'] = await feishu_client.import_document(
+                            Path(package_paths['docx']),
+                            document_name=listing['title'],
+                            folder_token=str(content_settings.get('feishu_folder_token') or ''),
+                        )
+                except FeishuDocumentError as exc:
+                    integration_warnings.append(str(exc))
+            else:
+                integration_warnings.append('已生成排版 DOCX；配置飞书 App ID/Secret 后可同步为飞书在线文档')
+        effective_delivery_text = str(request.delivery_text or '').strip()
+        if request.upload_to_quark:
+            quark_settings = _normalize_quark_catalog_settings(
+                db_manager.get_quark_catalog_settings(current_user['user_id'], include_secrets=True)
+            )
+            if not quark_settings.get('quark_cookie'):
+                integration_warnings.append('夸克 Cookie 尚未配置，PDF/ZIP 已保存在本地内容包')
+            else:
+                artifact_kind = str(request.quark_artifact or 'pdf').strip().lower()
+                artifact_path = Path(package_paths.get('pdf') or '') if artifact_kind == 'pdf' else Path(package_paths['zip'])
+                if artifact_kind == 'pdf' and not artifact_path.is_file():
+                    artifact_path = Path(package_paths['zip'])
+                    integration_warnings.append('本次未选择 PDF，已将 ZIP 内容包上传到夸克')
+                parent_fid = str(
+                    request.quark_parent_fid
+                    or content_settings.get('quark_parent_fid')
+                    or quark_settings.get('root_fid')
+                    or '0'
+                ).strip()
+                try:
+                    async with QuarkDriveClient(quark_settings['quark_cookie'], timeout_seconds=120) as quark_client:
+                        uploaded_entry = await quark_client.upload_file(artifact_path, parent_fid=parent_fid)
+                        share = await quark_client.create_share(
+                            uploaded_entry, expired_type=QUARK_SHARE_PERMANENT_EXPIRED_TYPE
+                        )
+                    integration_metadata['quark_delivery'] = {
+                        **share,
+                        'fid': uploaded_entry.fid,
+                        'file_name': uploaded_entry.name,
+                        'parent_fid': parent_fid,
+                    }
+                    effective_delivery_text = str(share.get('delivery_text') or effective_delivery_text)
+                except QuarkDriveError as exc:
+                    integration_warnings.append(f'夸克上传/分享失败：{str(exc)}')
         delivery_assets = _upsert_content_delivery_assets(
             user_id=current_user['user_id'], product_id=int(product_id), title=listing['title'],
-            delivery_text=str(request.delivery_text or ''),
+            delivery_text=effective_delivery_text,
             existing_metadata={'delivery': {}},
         )
         if delivery_assets:
             latest_metadata = (db_manager.get_content_product(product_id, current_user['user_id']) or {}).get('metadata') or {}
             latest_metadata['delivery'] = delivery_assets
             db_manager.update_content_product(product_id, current_user['user_id'], {'metadata': latest_metadata})
+        if integration_metadata or integration_warnings:
+            latest = db_manager.get_content_product(product_id, current_user['user_id']) or {}
+            latest_metadata = dict(latest.get('metadata') or {})
+            latest_metadata.update(integration_metadata)
+            latest_metadata['integration_warnings'] = integration_warnings
+            db_manager.update_content_product(product_id, current_user['user_id'], {'metadata': latest_metadata})
+        if request.browser_import_id:
+            db_manager.update_content_browser_import_status(
+                int(request.browser_import_id), current_user['user_id'], 'used'
+            )
     except Exception as exc:
         logger.exception('写入内容商品化包失败')
         db_manager.update_content_product(product_id, current_user['user_id'], {
@@ -12251,15 +12622,743 @@ async def generate_content_product(
     response = _content_product_public_view(product, current_user['user_id']) or {}
     response['publish_result'] = publish_result
     response['warnings'] = list(generated.get('warnings') or [])
+    response['warnings'].extend((response.get('metadata') or {}).get('integration_warnings') or [])
     if fetch_warning:
         response['warnings'].append(fetch_warning)
-    if not str(request.delivery_text or '').strip():
+    if not effective_delivery_text:
         response['warnings'].append('未配置自动发货文字/链接；可在“自动发货”中手动创建，或下次生成时填写')
     return {
         'success': True,
-        'message': '内容已生成：商品素材可继续编辑，Markdown/Skill 包已保存',
+        'message': '内容已生成：商品素材可继续编辑，所选内容包已保存',
         'product': response,
     }
+
+
+def _ip_project_public_view(project: Optional[Dict[str, Any]], *, include_source: bool = True) -> Optional[Dict[str, Any]]:
+    if not project:
+        return None
+    result = dict(project)
+    result['download_url'] = f"/ip-content-studio/projects/{int(result['id'])}/download?format=zip" if result.get('package_zip') else None
+    result['exports'] = {
+        key: f"/ip-content-studio/projects/{int(result['id'])}/download?format={key}"
+        for key in ('zip', 'markdown', 'html', 'docx', 'pdf')
+        if result.get('package_zip')
+    }
+    visuals = []
+    for item in result.get('visuals') or []:
+        visual = dict(item)
+        if visual.get('status') == 'ready':
+            visual['url'] = f"/ip-content-studio/projects/{int(result['id'])}/visuals/{visual.get('id')}"
+        visual.pop('path', None)
+        visuals.append(visual)
+    result['visuals'] = visuals
+    if not include_source:
+        result['source_excerpt'] = str(result.get('source_text') or '')[:500]
+        result.pop('source_text', None)
+        result.pop('source_images', None)
+        result.pop('analysis', None)
+        result.pop('variants', None)
+        result.pop('master_markdown', None)
+    return result
+
+
+IP_VISUAL_ASSET_TYPES = {
+    'portrait': '人物定妆', 'pose': '动作姿态', 'expression': '表情参考',
+    'outfit': '服装造型', 'scene': '固定场景', 'style_reference': '风格参考',
+    'cover_template': '封面模板', 'generated': '历史成图',
+}
+
+
+def _ip_visual_library_root(user_id: int, profile_id: int) -> Path:
+    return Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_visual_library' / str(int(user_id)) / str(int(profile_id))
+
+
+def _ip_visual_asset_public_view(asset: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(asset)
+    result.pop('file_path', None)
+    result['url'] = f"/ip-content-studio/visual-assets/{int(asset['id'])}/file"
+    result['asset_type_label'] = IP_VISUAL_ASSET_TYPES.get(str(asset.get('asset_type') or ''), '视觉素材')
+    return result
+
+
+def _ip_visual_reference_paths(assets: List[Dict[str, Any]], *, limit: int = 4) -> List[str]:
+    """Pick the strongest local references: primary, favorites, then newest."""
+    ordered = sorted(
+        list(assets or []),
+        key=lambda item: (
+            0 if item.get('is_primary') else 1,
+            0 if item.get('is_favorite') else 1,
+            -int(item.get('id') or 0),
+        ),
+    )
+    paths: List[str] = []
+    for item in ordered:
+        path = Path(str(item.get('file_path') or ''))
+        if path.is_file() and str(path) not in paths:
+            paths.append(str(path))
+        if len(paths) >= max(1, min(int(limit or 4), 4)):
+            break
+    return paths
+
+
+def _save_ip_visual_library_image(*, user_id: int, profile_id: int, raw: bytes, stem: str) -> Dict[str, Any]:
+    if not raw or len(raw) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail='图片大小需在 15MB 以内')
+    try:
+        jpeg, width, height = normalize_cover_image(raw)
+    except CatalogAIError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    directory = _ip_visual_library_root(user_id, profile_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    safe_stem = re.sub(r'[^A-Za-z0-9_-]+', '-', str(stem or 'visual')).strip('-')[:50] or 'visual'
+    path = directory / f"{safe_stem}-{uuid.uuid4().hex[:12]}.jpg"
+    path.write_bytes(jpeg)
+    return {
+        'file_path': str(path), 'mime_type': 'image/jpeg', 'width': width, 'height': height,
+        'sha256': hashlib.sha256(jpeg).hexdigest(),
+    }
+
+
+def _ip_visual_library_payload(profile_id: int, user_id: int) -> Dict[str, Any]:
+    profile = db_manager.get_ip_profile(profile_id, user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail='IP 档案不存在')
+    kit = db_manager.get_ip_visual_kit(profile_id, user_id) or {
+        'profile_id': profile_id,
+        'character_name': profile.get('display_name') or '',
+        'character_description': '',
+        'signature_elements': '',
+        'style_keywords': profile.get('visual_style') or '',
+        'negative_prompt': '',
+        'cover_rules': '首图主体突出，移动端缩略图中仍然清楚，有统一品牌色和留白。',
+        'inline_rules': '贴合段落观点，构图自然，不抢正文，人物外观与封面一致。',
+        'prompt_template': '',
+        'aspect_ratios': {'cover': '1:1', 'inline': '4:3'},
+    }
+    assets = [_ip_visual_asset_public_view(item) for item in db_manager.list_ip_visual_assets(profile_id, user_id)]
+    return {
+        'success': True, 'profile': profile, 'visual_kit': kit, 'assets': assets,
+        'asset_types': [{'key': key, 'label': label} for key, label in IP_VISUAL_ASSET_TYPES.items()],
+    }
+
+
+def _validate_ip_profile_payload(data: Dict[str, Any], *, partial: bool = False) -> Dict[str, Any]:
+    normalized = dict(data)
+    if not partial or 'name' in normalized:
+        name = str(normalized.get('name') or '').strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='IP 档案名称要填写')
+        normalized['name'] = name[:80]
+    if not partial or 'display_name' in normalized:
+        normalized['display_name'] = str(normalized.get('display_name') or normalized.get('name') or '').strip()[:80]
+    for key in ('topics', 'experiences', 'forbidden_phrases', 'brand_colors'):
+        if key in normalized:
+            normalized[key] = [str(item).strip()[:500] for item in (normalized.get(key) or []) if str(item).strip()][:100]
+    for key in ('positioning', 'audience', 'tone', 'opening_template', 'closing_template', 'bio', 'visual_style'):
+        if key in normalized and normalized[key] is not None:
+            normalized[key] = str(normalized[key]).strip()[:4000]
+    return normalized
+
+
+@app.get('/ip-content-studio/meta')
+def get_ip_content_studio_meta(current_user: Dict[str, Any] = Depends(get_current_user)):
+    imports = db_manager.list_content_browser_imports(current_user['user_id'], limit=100)
+    return {
+        'success': True,
+        'angles': [{'key': key, 'label': label} for key, label in ANGLE_LABELS.items()],
+        'platforms': [{'key': key, 'label': label} for key, label in PLATFORM_LABELS.items()],
+        'browser_imports': [{
+            'id': item['id'], 'source_title': item.get('source_title'), 'source_url': item.get('source_url'),
+            'author': item.get('author'), 'image_count': len(item.get('images') or []),
+            'created_at': item.get('created_at'), 'status': item.get('status'),
+        } for item in imports],
+    }
+
+
+@app.get('/ip-content-studio/profiles')
+def list_ip_profiles(current_user: Dict[str, Any] = Depends(get_current_user)):
+    return {'success': True, 'items': db_manager.list_ip_profiles(current_user['user_id'])}
+
+
+@app.post('/ip-content-studio/profiles')
+def create_ip_profile(request: IPProfileRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    data = _validate_ip_profile_payload(request.model_dump())
+    profile_id = db_manager.add_ip_profile(current_user['user_id'], data)
+    if not profile_id:
+        raise HTTPException(status_code=500, detail='保存 IP 档案失败')
+    return {'success': True, 'message': 'IP 档案已保存', 'profile': db_manager.get_ip_profile(profile_id, current_user['user_id'])}
+
+
+@app.put('/ip-content-studio/profiles/{profile_id}')
+def update_ip_profile(profile_id: int, request: IPProfileUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    if not db_manager.get_ip_profile(profile_id, current_user['user_id']):
+        raise HTTPException(status_code=404, detail='IP 档案不存在')
+    data = _validate_ip_profile_payload(request.model_dump(exclude_unset=True), partial=True)
+    if not data:
+        raise HTTPException(status_code=400, detail='请填写要更新的档案内容')
+    if not db_manager.update_ip_profile(profile_id, current_user['user_id'], data):
+        raise HTTPException(status_code=500, detail='更新 IP 档案失败')
+    return {'success': True, 'message': 'IP 档案已更新', 'profile': db_manager.get_ip_profile(profile_id, current_user['user_id'])}
+
+
+@app.delete('/ip-content-studio/profiles/{profile_id}')
+def delete_ip_profile(profile_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    if not db_manager.get_ip_profile(profile_id, current_user['user_id']):
+        raise HTTPException(status_code=404, detail='IP 档案不存在')
+    projects = db_manager.list_ip_content_projects(current_user['user_id'], page=1, page_size=100).get('items') or []
+    if any(int(item.get('profile_id') or 0) == int(profile_id) for item in projects):
+        raise HTTPException(status_code=409, detail='该档案已有创作项目，请先删除项目或保留档案')
+    if not db_manager.delete_ip_profile(profile_id, current_user['user_id']):
+        raise HTTPException(status_code=500, detail='删除 IP 档案失败')
+    return {'success': True, 'message': 'IP 档案已删除'}
+
+
+@app.get('/ip-content-studio/profiles/{profile_id}/visual-library')
+def get_ip_visual_library(profile_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    return _ip_visual_library_payload(profile_id, current_user['user_id'])
+
+
+@app.put('/ip-content-studio/profiles/{profile_id}/visual-kit')
+def save_ip_visual_kit(profile_id: int, request: IPVisualKitRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    if not db_manager.get_ip_profile(profile_id, user_id):
+        raise HTTPException(status_code=404, detail='IP 档案不存在')
+    data = request.model_dump()
+    for key in (
+        'character_name', 'character_description', 'signature_elements', 'style_keywords',
+        'negative_prompt', 'cover_rules', 'inline_rules', 'prompt_template',
+    ):
+        data[key] = str(data.get(key) or '').strip()[:6000]
+    data['aspect_ratios'] = {
+        str(key)[:40]: str(value)[:40]
+        for key, value in (data.get('aspect_ratios') or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    if not db_manager.upsert_ip_visual_kit(profile_id, user_id, data):
+        raise HTTPException(status_code=500, detail='视觉 IP 设定保存失败')
+    return {'success': True, 'message': '视觉 IP 指纹已保存', **_ip_visual_library_payload(profile_id, user_id)}
+
+
+@app.post('/ip-content-studio/profiles/{profile_id}/visual-assets/upload')
+async def upload_ip_visual_assets(
+    profile_id: int,
+    files: List[UploadFile] = File(...),
+    asset_type: str = Form('style_reference'),
+    name: str = Form(''),
+    tags: str = Form(''),
+    notes: str = Form(''),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = current_user['user_id']
+    if not db_manager.get_ip_profile(profile_id, user_id):
+        raise HTTPException(status_code=404, detail='IP 档案不存在')
+    asset_type = asset_type if asset_type in IP_VISUAL_ASSET_TYPES else 'style_reference'
+    selected = list(files or [])[:20]
+    if not selected:
+        raise HTTPException(status_code=400, detail='请选择图片文件')
+    parsed_tags = [item.strip()[:80] for item in re.split(r'[,，\n]+', tags or '') if item.strip()][:30]
+    created: List[Dict[str, Any]] = []
+    for index, upload in enumerate(selected):
+        raw = await upload.read()
+        saved = _save_ip_visual_library_image(
+            user_id=user_id, profile_id=profile_id, raw=raw,
+            stem=Path(upload.filename or f'upload-{index + 1}').stem,
+        )
+        asset_name = str(name or '').strip() if len(selected) == 1 else ''
+        asset_id = db_manager.add_ip_visual_asset(user_id, profile_id, {
+            **saved,
+            'name': (asset_name or Path(upload.filename or f'视觉素材 {index + 1}').stem)[:120],
+            'asset_type': asset_type, 'source_type': 'upload', 'tags': parsed_tags,
+            'notes': str(notes or '').strip()[:3000], 'is_primary': False,
+        })
+        if not asset_id:
+            Path(saved['file_path']).unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail='视觉素材入库失败')
+        created.append(_ip_visual_asset_public_view(db_manager.get_ip_visual_asset(asset_id, user_id)))
+    return {'success': True, 'message': f'已加入 {len(created)} 张视觉素材', 'items': created}
+
+
+@app.post('/ip-content-studio/profiles/{profile_id}/visual-assets/generate')
+async def generate_ip_visual_asset(profile_id: int, request: IPVisualAssetGenerateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    profile = db_manager.get_ip_profile(profile_id, user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail='IP 档案不存在')
+    base_prompt = str(request.prompt or '').strip()
+    if len(base_prompt) < 8:
+        raise HTTPException(status_code=400, detail='请写清本次素材想表达的画面')
+    kit = db_manager.get_ip_visual_kit(profile_id, user_id) or {}
+    references = db_manager.list_ip_visual_assets(profile_id, user_id)
+    prompt = build_visual_identity_prompt(
+        profile=profile, visual_kit=kit, reference_assets=references,
+        purpose='cover' if request.purpose == 'cover' else 'inline', user_prompt=base_prompt,
+    )
+    settings = _normalize_quark_catalog_settings(db_manager.get_quark_catalog_settings(user_id, include_secrets=True))
+    missing = [label for key, label in {
+        'image_base_url': '生图接口地址', 'image_api_key': '生图 API Key', 'image_model': '生图模型',
+    }.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(missing)}")
+    try:
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            image_size=settings['image_size'], timeout_seconds=180,
+        ) as ai_client:
+            image = await ai_client.generate_with_references(prompt, _ip_visual_reference_paths(references))
+        raw = base64.b64decode(str(image.get('content') or ''), validate=False)
+        saved = _save_ip_visual_library_image(user_id=user_id, profile_id=profile_id, raw=raw, stem='generated')
+        asset_type = request.asset_type if request.asset_type in IP_VISUAL_ASSET_TYPES else 'generated'
+        asset_id = db_manager.add_ip_visual_asset(user_id, profile_id, {
+            **saved, 'name': str(request.name or base_prompt[:40]).strip()[:120],
+            'asset_type': asset_type, 'source_type': 'generated',
+            'tags': [str(item).strip()[:80] for item in request.tags if str(item).strip()][:30],
+            'notes': str(request.notes or '').strip()[:3000], 'prompt': prompt,
+            'is_favorite': True,
+        })
+        if not asset_id:
+            Path(saved['file_path']).unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail='生成图入库失败')
+    except CatalogAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        'success': True,
+        'message': '新图已按视觉 IP 指纹生成并收藏',
+        'warning': image.get('reference_warning'),
+        'reference_mode': image.get('reference_mode'),
+        'item': _ip_visual_asset_public_view(db_manager.get_ip_visual_asset(asset_id, user_id)),
+    }
+
+
+@app.put('/ip-content-studio/visual-assets/{asset_id}')
+def update_ip_visual_asset(asset_id: int, request: IPVisualAssetUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    asset = db_manager.get_ip_visual_asset(asset_id, user_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail='视觉素材不存在')
+    data = request.model_dump(exclude_unset=True)
+    if 'asset_type' in data and data['asset_type'] not in IP_VISUAL_ASSET_TYPES:
+        raise HTTPException(status_code=400, detail='素材类型不在支持范围内')
+    if 'name' in data:
+        data['name'] = str(data.get('name') or '').strip()[:120]
+        if not data['name']:
+            raise HTTPException(status_code=400, detail='素材名称要填写')
+    if 'tags' in data:
+        data['tags'] = [str(item).strip()[:80] for item in (data.get('tags') or []) if str(item).strip()][:30]
+    for key in ('notes', 'prompt'):
+        if key in data:
+            data[key] = str(data.get(key) or '').strip()[:6000]
+    if not data or not db_manager.update_ip_visual_asset(asset_id, user_id, data):
+        raise HTTPException(status_code=500, detail='视觉素材更新失败')
+    return {'success': True, 'message': '视觉素材已更新', 'item': _ip_visual_asset_public_view(db_manager.get_ip_visual_asset(asset_id, user_id))}
+
+
+@app.get('/ip-content-studio/visual-assets/{asset_id}/file')
+def get_ip_visual_asset_file(asset_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    asset = db_manager.get_ip_visual_asset(asset_id, user_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail='视觉素材不存在')
+    path = Path(str(asset.get('file_path') or ''))
+    allowed_root = _ip_visual_library_root(user_id, int(asset['profile_id'])).resolve()
+    try:
+        path.resolve().relative_to(allowed_root)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail='视觉素材文件不存在')
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='视觉素材文件不存在')
+    return FileResponse(str(path), media_type=str(asset.get('mime_type') or 'image/jpeg'))
+
+
+@app.delete('/ip-content-studio/visual-assets/{asset_id}')
+def delete_ip_visual_asset(asset_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    asset = db_manager.get_ip_visual_asset(asset_id, user_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail='视觉素材不存在')
+    if not db_manager.delete_ip_visual_asset(asset_id, user_id):
+        raise HTTPException(status_code=500, detail='视觉素材删除失败')
+    path = Path(str(asset.get('file_path') or ''))
+    allowed_root = _ip_visual_library_root(user_id, int(asset['profile_id'])).resolve()
+    try:
+        path.resolve().relative_to(allowed_root)
+        path.unlink(missing_ok=True)
+    except (ValueError, OSError):
+        pass
+    return {'success': True, 'message': '视觉素材已删除'}
+
+
+@app.post('/ip-content-studio/projects/{project_id}/visuals/{visual_id}/save-to-library')
+def save_project_visual_to_library(project_id: int, visual_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    project = db_manager.get_ip_content_project(project_id, user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    profile_id = int(project.get('profile_id') or 0)
+    if not db_manager.get_ip_profile(profile_id, user_id):
+        raise HTTPException(status_code=409, detail='项目关联的 IP 档案已不存在')
+    visual = next((item for item in project.get('visuals') or [] if str(item.get('id')) == str(visual_id)), None)
+    if not visual or visual.get('status') != 'ready':
+        raise HTTPException(status_code=404, detail='这张项目配图尚未生成')
+    source = Path(str(visual.get('path') or ''))
+    package_root = Path(str(project.get('package_dir') or '')).resolve()
+    try:
+        source.resolve().relative_to(package_root)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail='项目配图文件不存在')
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail='项目配图文件不存在')
+    existing = next((item for item in db_manager.list_ip_visual_assets(profile_id, user_id)
+                     if int(item.get('project_id') or 0) == int(project_id) and str(item.get('project_visual_id') or '') == str(visual_id)), None)
+    if existing:
+        return {'success': True, 'message': '这张图已在视觉素材库中', 'item': _ip_visual_asset_public_view(existing)}
+    saved = _save_ip_visual_library_image(user_id=user_id, profile_id=profile_id, raw=source.read_bytes(), stem=f'project-{project_id}-{visual_id}')
+    asset_id = db_manager.add_ip_visual_asset(user_id, profile_id, {
+        **saved, 'project_id': project_id, 'project_visual_id': str(visual_id),
+        'name': str(visual.get('alt') or visual.get('section_title') or '项目配图')[:120],
+        'asset_type': 'generated', 'source_type': 'project',
+        'tags': [str(visual.get('slot') or 'inline')], 'notes': f"收藏自项目：{project.get('title') or project.get('source_title') or project_id}",
+        'prompt': str(visual.get('prompt') or '')[:6000], 'is_favorite': True,
+    })
+    if not asset_id:
+        Path(saved['file_path']).unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail='项目配图收藏失败')
+    return {'success': True, 'message': '项目配图已收藏到视觉素材库', 'item': _ip_visual_asset_public_view(db_manager.get_ip_visual_asset(asset_id, user_id))}
+
+
+@app.post('/ip-content-studio/projects/analyze')
+async def analyze_ip_content_source(request: IPProjectAnalyzeRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    profile = db_manager.get_ip_profile(request.profile_id, user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail='请先选择有效的 IP 档案')
+    source_url = str(request.source_url or '').strip()
+    source_title = str(request.source_title or '').strip()
+    source_author = str(request.source_author or '').strip()
+    source_text = str(request.source_text or '')
+    source_images = list(request.source_images or [])
+    browser_import = None
+    if request.browser_import_id:
+        browser_import = db_manager.get_content_browser_import(int(request.browser_import_id), user_id)
+        if not browser_import:
+            raise HTTPException(status_code=404, detail='Chrome 采集记录不存在')
+        source_url = str(browser_import.get('source_url') or source_url).strip()
+        source_title = str(browser_import.get('source_title') or source_title).strip()
+        source_author = str(browser_import.get('author') or source_author).strip()
+        source_text = str(browser_import.get('source_text') or source_text)
+        source_images = list(browser_import.get('images') or source_images)
+    elif len(source_text.strip()) < 80 and source_url:
+        try:
+            fetched = await fetch_content_source(source_url)
+            source_text = fetched.text
+            source_title = source_title or fetched.title
+        except ContentProductError as exc:
+            raise HTTPException(status_code=422, detail=f'{str(exc)}；也可以使用 Chrome 扩展采集后再分析') from exc
+    if len(source_text.strip()) < 80:
+        raise HTTPException(status_code=400, detail='请提供至少 80 个字的正文，或选择 Chrome 采集内容')
+    if len(source_text) > 100000:
+        source_text = source_text[:100000]
+    deterministic_clean = preclean_source_text(source_text, author=source_author)
+    if len(str(deterministic_clean.get('clean_text') or '')) < 60:
+        raise HTTPException(status_code=400, detail='清洗后正文过短，请检查采集内容是否完整')
+    project_id = db_manager.add_ip_content_project(user_id, {
+        'profile_id': profile['id'], 'browser_import_id': request.browser_import_id,
+        'source_url': source_url, 'source_title': source_title or '未命名来源',
+        'source_author': source_author, 'source_text': source_text, 'source_images': source_images,
+        'brief': {'stage': 'analysis'}, 'status': 'analyzing',
+    })
+    if not project_id:
+        raise HTTPException(status_code=500, detail='创建 IP 创作项目失败')
+    settings = _normalize_quark_catalog_settings(db_manager.get_quark_catalog_settings(user_id, include_secrets=True))
+    missing = [label for key, label in {
+        'text_base_url': '文案接口地址', 'text_api_key': '文案 API Key', 'text_model': '文案模型',
+    }.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        db_manager.update_ip_content_project(project_id, user_id, {'status': 'failed', 'error_message': f"请先配置：{'、'.join(missing)}"})
+        raise HTTPException(status_code=400, detail=f"请先在商品发布配置中保存：{'、'.join(missing)}")
+    try:
+        system_prompt, user_prompt = build_analysis_prompts(
+            profile=profile, source_title=source_title, source_url=source_url,
+            source_author=source_author, source_text=source_text,
+            deterministic_clean=deterministic_clean,
+        )
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            image_size=settings['image_size'], timeout_seconds=180,
+        ) as ai_client:
+            raw_analysis = await ai_client.generate_json(system_prompt, user_prompt, temperature=0.2)
+        analysis = normalize_analysis(raw_analysis, deterministic_clean)
+        db_manager.update_ip_content_project(project_id, user_id, {
+            'analysis': analysis,
+            'brief': {'stage': 'analyzed', 'suggested_angles': analysis.get('suggested_angles') or []},
+            'status': 'analyzed', 'error_message': None,
+        })
+    except CatalogAIError as exc:
+        db_manager.update_ip_content_project(project_id, user_id, {'status': 'failed', 'error_message': str(exc)[:1000]})
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {'success': True, 'message': '来源知识已拆解，原作者身份和宣传内容已隔离', 'project': _ip_project_public_view(db_manager.get_ip_content_project(project_id, user_id))}
+
+
+@app.post('/ip-content-studio/projects/{project_id}/generate')
+async def generate_ip_content_project(project_id: int, request: IPProjectGenerateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    project = db_manager.get_ip_content_project(project_id, user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    profile = db_manager.get_ip_profile(int(project.get('profile_id') or 0), user_id)
+    if not profile:
+        raise HTTPException(status_code=409, detail='项目关联的 IP 档案已不存在')
+    analysis = project.get('analysis') or {}
+    if not analysis.get('clean_knowledge'):
+        raise HTTPException(status_code=409, detail='请先完成来源分析')
+    angle = request.angle if request.angle in ANGLE_LABELS else 'recent_learning'
+    platforms = [item for item in request.platforms if item in PLATFORM_LABELS] or ['wechat']
+    image_count = max(0, min(int(request.image_count or 0), 8))
+    brief = {
+        'stage': 'generating', 'angle': angle, 'angle_label': ANGLE_LABELS[angle],
+        'custom_direction': str(request.custom_direction or '').strip(),
+        'platforms': platforms, 'generate_images': bool(request.generate_images),
+        'image_count': image_count,
+    }
+    db_manager.update_ip_content_project(project_id, user_id, {'status': 'generating', 'brief': brief, 'error_message': None})
+    settings = _normalize_quark_catalog_settings(db_manager.get_quark_catalog_settings(user_id, include_secrets=True))
+    missing_text = [label for key, label in {
+        'text_base_url': '文案接口地址', 'text_api_key': '文案 API Key', 'text_model': '文案模型',
+    }.items() if not str(settings.get(key) or '').strip()]
+    if missing_text:
+        message = f"请先配置：{'、'.join(missing_text)}"
+        db_manager.update_ip_content_project(project_id, user_id, {
+            'status': 'failed',
+            'error_message': message,
+            'brief': {**brief, 'stage': 'configuration_required'},
+        })
+        raise HTTPException(status_code=400, detail=message)
+    visual_warnings: List[str] = []
+    visual_kit = db_manager.get_ip_visual_kit(int(profile['id']), user_id) or {}
+    visual_references = db_manager.list_ip_visual_assets(int(profile['id']), user_id)
+    visual_reference_paths = _ip_visual_reference_paths(visual_references)
+    try:
+        system_prompt, user_prompt = build_generation_prompts(
+            profile=profile, analysis=analysis, angle=angle,
+            custom_direction=brief['custom_direction'], platforms=platforms,
+            source_title=str(project.get('source_title') or ''),
+        )
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            image_size=settings['image_size'], timeout_seconds=240,
+        ) as ai_client:
+            raw_generation = await ai_client.generate_json(system_prompt, user_prompt, temperature=0.62)
+            generated = normalize_generation(raw_generation, platforms)
+            if len(generated.get('master_markdown') or '') < 300:
+                raise CatalogAIError('母稿内容过短，请补充来源内容或创作方向后重试')
+            visuals = list(generated.get('visuals') or [])
+            project_dir = Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_content_studio' / str(user_id) / str(project_id)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            if request.generate_images and image_count:
+                image_ready = all(str(settings.get(key) or '').strip() for key in ('image_base_url', 'image_api_key', 'image_model'))
+                if not image_ready:
+                    visual_warnings.append('生图配置未完整，已保留全部配图提示词')
+                else:
+                    for index, visual in enumerate(visuals):
+                        if index >= image_count:
+                            break
+                        prompt = str(visual.get('prompt') or '').strip()
+                        if not prompt:
+                            continue
+                        base_prompt = prompt
+                        prompt = build_visual_identity_prompt(
+                            profile=profile, visual_kit=visual_kit, reference_assets=visual_references,
+                            purpose='cover' if visual.get('slot') == 'cover' else 'inline',
+                            user_prompt=prompt,
+                        )
+                        visuals[index] = {**visuals[index], 'base_prompt': base_prompt, 'prompt': prompt}
+                        try:
+                            image = await ai_client.generate_with_references(prompt, visual_reference_paths)
+                            visuals[index] = save_visual_asset(
+                                project_dir,
+                                {
+                                    **visuals[index],
+                                    'reference_mode': image.get('reference_mode'),
+                                    'reference_count': image.get('reference_count', 0),
+                                },
+                                image,
+                            )
+                            if image.get('reference_warning') and image['reference_warning'] not in visual_warnings:
+                                visual_warnings.append(str(image['reference_warning']))
+                        except Exception as exc:
+                            visuals[index] = {**visuals[index], 'status': 'failed', 'error': mask_sensitive_text(exc)}
+                            visual_warnings.append(f"{visual.get('alt') or visual.get('id')} 生图失败：{mask_sensitive_text(exc)}")
+        quality = assess_originality(project.get('source_text') or '', generated['master_markdown'], analysis)
+        quality['confirmation_items'] = generated.get('confirmation_items') or []
+        quality['fact_notes'] = generated.get('fact_notes') or []
+        quality['warnings'] = visual_warnings
+        status_value = 'ready' if quality.get('passed') else 'review_required'
+        update_data = {
+            'title': generated['title'], 'summary': generated['summary'],
+            'master_markdown': generated['master_markdown'], 'variants': generated['variants'],
+            'visuals': visuals, 'quality': quality,
+            'brief': {**brief, 'stage': 'ready'}, 'status': status_value,
+        }
+        db_manager.update_ip_content_project(project_id, user_id, update_data)
+        latest = db_manager.get_ip_content_project(project_id, user_id) or {**project, **update_data}
+        package_paths = write_project_package(
+            Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_content_studio' / str(user_id),
+            project_id, latest, profile,
+        )
+        db_manager.update_ip_content_project(project_id, user_id, {
+            'package_dir': package_paths['directory'], 'package_zip': package_paths['zip'],
+        })
+    except CatalogAIError as exc:
+        db_manager.update_ip_content_project(project_id, user_id, {'status': 'failed', 'error_message': str(exc)[:1000]})
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception('IP 内容工厂生成失败')
+        db_manager.update_ip_content_project(project_id, user_id, {'status': 'failed', 'error_message': str(exc)[:1000]})
+        raise HTTPException(status_code=500, detail=f'IP 内容生成失败：{mask_sensitive_text(exc)}') from exc
+    return {'success': True, 'message': '个人 IP 母稿、多平台版本和导出包已生成', 'project': _ip_project_public_view(db_manager.get_ip_content_project(project_id, user_id))}
+
+
+@app.get('/ip-content-studio/projects')
+def list_ip_content_projects(page: int = 1, page_size: int = 20, current_user: Dict[str, Any] = Depends(get_current_user)):
+    data = db_manager.list_ip_content_projects(current_user['user_id'], page=page, page_size=page_size)
+    data['items'] = [_ip_project_public_view(item, include_source=False) for item in data.get('items') or []]
+    return {'success': True, **data}
+
+
+@app.get('/ip-content-studio/projects/{project_id}')
+def get_ip_content_project(project_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    project = db_manager.get_ip_content_project(project_id, current_user['user_id'])
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    return {'success': True, 'project': _ip_project_public_view(project)}
+
+
+@app.put('/ip-content-studio/projects/{project_id}')
+def update_ip_content_project(project_id: int, request: IPProjectUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    project = db_manager.get_ip_content_project(project_id, user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    updates = request.model_dump(exclude_unset=True)
+    if 'title' in updates and not str(updates.get('title') or '').strip():
+        raise HTTPException(status_code=400, detail='文章标题要填写')
+    if 'master_markdown' in updates and len(str(updates.get('master_markdown') or '').strip()) < 80:
+        raise HTTPException(status_code=400, detail='母稿内容至少保留 80 个字')
+    if not updates or not db_manager.update_ip_content_project(project_id, user_id, updates):
+        raise HTTPException(status_code=500, detail='保存项目修改失败')
+    latest = db_manager.get_ip_content_project(project_id, user_id)
+    quality = assess_originality(latest.get('source_text') or '', latest.get('master_markdown') or '', latest.get('analysis') or {})
+    quality['confirmation_items'] = (latest.get('quality') or {}).get('confirmation_items') or []
+    db_manager.update_ip_content_project(project_id, user_id, {'quality': quality, 'status': 'ready' if quality.get('passed') else 'review_required'})
+    latest = db_manager.get_ip_content_project(project_id, user_id)
+    profile = db_manager.get_ip_profile(int(latest.get('profile_id') or 0), user_id) or {}
+    paths = write_project_package(Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_content_studio' / str(user_id), project_id, latest, profile)
+    db_manager.update_ip_content_project(project_id, user_id, {'package_dir': paths['directory'], 'package_zip': paths['zip']})
+    return {'success': True, 'message': '修改已保存并重新导出', 'project': _ip_project_public_view(db_manager.get_ip_content_project(project_id, user_id))}
+
+
+@app.post('/ip-content-studio/projects/{project_id}/visuals/{visual_id}/regenerate')
+async def regenerate_ip_visual(project_id: int, visual_id: str, request: IPVisualRegenerateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    project = db_manager.get_ip_content_project(project_id, user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    visuals = list(project.get('visuals') or [])
+    index = next((idx for idx, item in enumerate(visuals) if str(item.get('id')) == str(visual_id)), -1)
+    if index < 0:
+        raise HTTPException(status_code=404, detail='配图方案不存在')
+    profile = db_manager.get_ip_profile(int(project.get('profile_id') or 0), user_id) or {}
+    suggestion = str(request.suggestion or '').strip()
+    prompt = str(request.prompt or visuals[index].get('base_prompt') or visuals[index].get('prompt') or '').strip()
+    if suggestion:
+        prompt += f"\n用户本次修改建议：{suggestion}"
+    prompt = build_visual_identity_prompt(
+        profile=profile,
+        visual_kit=db_manager.get_ip_visual_kit(int(profile.get('id') or 0), user_id) or {},
+        reference_assets=(visual_references := db_manager.list_ip_visual_assets(int(profile.get('id') or 0), user_id)),
+        purpose='cover' if visuals[index].get('slot') == 'cover' else 'inline',
+        user_prompt=prompt,
+    )
+    settings = _normalize_quark_catalog_settings(db_manager.get_quark_catalog_settings(user_id, include_secrets=True))
+    missing = [label for key, label in {'image_base_url': '生图接口地址', 'image_api_key': '生图 API Key', 'image_model': '生图模型'}.items() if not str(settings.get(key) or '').strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(missing)}")
+    try:
+        async with CatalogAIClient(
+            text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'], text_model=settings['text_model'],
+            image_base_url=settings['image_base_url'], image_api_key=settings['image_api_key'], image_model=settings['image_model'],
+            image_size=settings['image_size'], timeout_seconds=180,
+        ) as ai_client:
+            image = await ai_client.generate_with_references(prompt, _ip_visual_reference_paths(visual_references))
+        project_dir = Path(str(project.get('package_dir') or (Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_content_studio' / str(user_id) / str(project_id))))
+        visuals[index] = save_visual_asset(project_dir, {
+            **visuals[index],
+            'base_prompt': str(request.prompt or visuals[index].get('base_prompt') or '').strip(),
+            'prompt': prompt,
+            'reference_mode': image.get('reference_mode'),
+            'reference_count': image.get('reference_count', 0),
+            'reference_warning': image.get('reference_warning'),
+        }, image)
+        db_manager.update_ip_content_project(project_id, user_id, {'visuals': visuals})
+        latest = db_manager.get_ip_content_project(project_id, user_id)
+        paths = write_project_package(Path(os.getenv('XIANYU_DATA_DIR', 'data')) / 'ip_content_studio' / str(user_id), project_id, latest, profile)
+        db_manager.update_ip_content_project(project_id, user_id, {'package_dir': paths['directory'], 'package_zip': paths['zip']})
+    except CatalogAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {'success': True, 'message': '配图已按建议重新生成', 'project': _ip_project_public_view(db_manager.get_ip_content_project(project_id, user_id))}
+
+
+@app.get('/ip-content-studio/projects/{project_id}/visuals/{visual_id}')
+def get_ip_visual(project_id: int, visual_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    project = db_manager.get_ip_content_project(project_id, current_user['user_id'])
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    visual = next((item for item in project.get('visuals') or [] if str(item.get('id')) == str(visual_id)), None)
+    path = Path(str((visual or {}).get('path') or ''))
+    package_dir = Path(str(project.get('package_dir') or '')).resolve()
+    try:
+        path.resolve().relative_to(package_dir)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail='配图文件不存在')
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='配图文件不存在')
+    return FileResponse(str(path), media_type='image/jpeg')
+
+
+@app.get('/ip-content-studio/projects/{project_id}/download')
+def download_ip_content_project(project_id: int, format: str = 'zip', current_user: Dict[str, Any] = Depends(get_current_user)):
+    project = db_manager.get_ip_content_project(project_id, current_user['user_id'])
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    fmt = str(format or 'zip').lower()
+    paths = {
+        'zip': Path(str(project.get('package_zip') or '')),
+        'markdown': Path(str(project.get('package_dir') or '')) / 'master.md',
+        'html': Path(str(project.get('package_dir') or '')) / 'article.html',
+        'docx': Path(str(project.get('package_dir') or '')) / 'article.docx',
+        'pdf': Path(str(project.get('package_dir') or '')) / 'article.pdf',
+    }
+    if fmt not in paths:
+        raise HTTPException(status_code=400, detail='导出格式支持 zip、markdown、html、docx、pdf')
+    path = paths[fmt]
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='导出文件尚未生成，请先完成母稿生成')
+    media = {'zip': 'application/zip', 'markdown': 'text/markdown', 'html': 'text/html', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'pdf': 'application/pdf'}[fmt]
+    suffix = {'markdown': 'md'}.get(fmt, fmt)
+    return FileResponse(str(path), filename=f'ip-content-{project_id}.{suffix}', media_type=media)
+
+
+@app.delete('/ip-content-studio/projects/{project_id}')
+def delete_ip_content_project(project_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    project = db_manager.get_ip_content_project(project_id, current_user['user_id'])
+    if not project:
+        raise HTTPException(status_code=404, detail='IP 创作项目不存在')
+    if not db_manager.delete_ip_content_project(project_id, current_user['user_id']):
+        raise HTTPException(status_code=500, detail='删除 IP 创作项目失败')
+    remove_project_package(project)
+    return {'success': True, 'message': '创作项目和本地导出已删除'}
 
 
 @app.get('/content-products')
@@ -12323,18 +13422,36 @@ def update_content_product(
         package_dir = Path(str(latest.get('package_dir') or ''))
         source_text_path = package_dir / 'source.txt'
         if package_dir.is_dir() and source_text_path.is_file():
+            package_metadata: Dict[str, Any] = {}
+            package_metadata_path = package_dir / 'metadata.json'
+            if package_metadata_path.is_file():
+                try:
+                    package_metadata = json.loads(package_metadata_path.read_text(encoding='utf-8'))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    package_metadata = {}
+            stored_source = package_metadata.get('source') or {}
+            stored_listing = package_metadata.get('listing') or {}
             source = ContentSource(
                 url=str(latest.get('source_url') or ''),
                 title=str(latest.get('source_title') or ''),
                 text=source_text_path.read_text(encoding='utf-8'),
                 excerpt=str(latest.get('source_excerpt') or ''),
                 fetched=True,
+                blocks=list(stored_source.get('blocks') or []),
             )
             write_product_package(
                 package_dir.parent, str(product_id), source,
-                {'title': latest.get('title'), 'description': latest.get('description'), 'category': latest.get('category')},
+                {
+                    'title': latest.get('title'),
+                    'description': latest.get('description'),
+                    'category': latest.get('category'),
+                    'suggested_price': latest.get('price'),
+                    'original_price': latest.get('original_price'),
+                    'images': stored_listing.get('images') or [],
+                },
                 rights_status=latest.get('rights_status') or 'reference_only',
                 output_mode=latest.get('output_mode') or 'bundle',
+                output_formats=(latest.get('metadata') or {}).get('output_formats') or [],
             )
     except Exception as exc:
         logger.warning(f'更新后重建内容包失败: {exc}')
@@ -17184,6 +18301,12 @@ async def apply_updates(current_user: Dict[str, Any] = Depends(get_current_user)
         # 只允许管理员执行更新，兼容历史 admin 用户名判断
         if not current_user.get('is_admin') and current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以执行更新")
+
+        if str(os.getenv('XIANYU_ENABLE_SELF_UPDATE', '')).strip().lower() not in {'1', 'true', 'yes', 'on'}:
+            raise HTTPException(
+                status_code=409,
+                detail="网页热更新已锁定；此定制项目使用 Git 分支进行版本管理"
+            )
         
         updater = get_updater()
         

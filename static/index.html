@@ -95,6 +95,12 @@
           <span>链接商品化</span>
         </a>
       </div>
+      <div class="nav-item" data-menu-id="ip-content-studio">
+        <a href="javascript:void(0)" class="nav-link" onclick="showSection('ip-content-studio')">
+          <i class="bi bi-person-bounding-box"></i>
+          <span>IP 内容工厂</span>
+        </a>
+      </div>
       <div class="nav-item" data-menu-id="items">
         <a href="javascript:void(0)" class="nav-link" onclick="showSection('items')">
           <i class="bi bi-box-seam"></i>
@@ -1272,18 +1278,32 @@
             <div class="text-muted small">动态渲染的 X 页面可以同时粘贴正文；系统会保存来源链接、整理稿和原文快照，生成后可编辑再发布。</div>
           </div>
           <div class="card-body">
+            <div class="alert alert-info border mb-3">
+              <div class="d-flex flex-wrap align-items-center gap-2">
+                <strong><i class="bi bi-browser-chrome me-1"></i>本机 Chrome 采集</strong>
+                <button class="btn btn-sm btn-outline-primary" type="button" onclick="createContentImportToken()">生成扩展配对码</button>
+                <button class="btn btn-sm btn-outline-primary" type="button" onclick="loadContentBrowserImports()">刷新采集</button>
+                <code id="contentImportTokenDisplay" class="user-select-all">尚未生成配对码</code>
+              </div>
+              <div class="small mt-2">在 Chrome 扩展页加载项目内 <code>chrome-extension</code> 目录；打开 X 长文、展开线程后点扩展即可采集正文和图片。</div>
+            </div>
             <div class="row g-3">
+              <div class="col-12">
+                <label class="form-label" for="contentBrowserImportSelect">Chrome 待处理内容</label>
+                <select class="form-select" id="contentBrowserImportSelect" onchange="loadSelectedBrowserImport()"><option value="">手动输入链接/正文</option></select>
+              </div>
               <div class="col-md-8">
                 <label class="form-label" for="contentProductSourceUrl">文章链接</label>
                 <input class="form-control" id="contentProductSourceUrl" type="url" placeholder="https://x.com/... 或其他公开文章链接">
               </div>
               <div class="col-md-4">
-                <label class="form-label" for="contentProductOutputMode">交付形式</label>
-                <select class="form-select" id="contentProductOutputMode">
-                  <option value="bundle" selected>文档 + Skill 组合包</option>
-                  <option value="document">仅 Markdown 文档</option>
-                  <option value="skill">仅 Skill 包</option>
-                </select>
+                <label class="form-label d-block">交付形式（可多选）</label>
+                <div class="d-flex flex-wrap gap-3 pt-2">
+                  <div class="form-check"><input class="form-check-input content-output-format" type="checkbox" value="markdown" id="contentOutputMarkdown" checked><label class="form-check-label" for="contentOutputMarkdown">Markdown</label></div>
+                  <div class="form-check"><input class="form-check-input content-output-format" type="checkbox" value="pdf" id="contentOutputPdf" checked><label class="form-check-label" for="contentOutputPdf">PDF</label></div>
+                  <div class="form-check"><input class="form-check-input content-output-format" type="checkbox" value="feishu" id="contentOutputFeishu"><label class="form-check-label" for="contentOutputFeishu">飞书文档</label></div>
+                  <div class="form-check"><input class="form-check-input content-output-format" type="checkbox" value="skill" id="contentOutputSkill" checked><label class="form-check-label" for="contentOutputSkill">Skill</label></div>
+                </div>
               </div>
               <div class="col-12">
                 <label class="form-label" for="contentProductSourceText">正文补充（推荐）</label>
@@ -1332,7 +1352,30 @@
                 <textarea class="form-control" id="contentProductDeliveryText" rows="3" maxlength="12000" placeholder="填写买家付款后要收到的文字、夸克永久分享链接、飞书文档链接等；填写后会自动创建卡券和按标题匹配的发货规则"></textarea>
                 <div class="form-text">留空时只生成内容包和商品素材，不会创建自动发货规则。请使用长期有效、买家可访问的链接。</div>
               </div>
+              <div class="col-md-4 d-flex align-items-end">
+                <div class="form-check form-switch mb-2">
+                  <input class="form-check-input" type="checkbox" id="contentProductUploadQuark">
+                  <label class="form-check-label" for="contentProductUploadQuark">上传 PDF/ZIP 到夸克并生成永久链接</label>
+                </div>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="contentProductQuarkArtifact">夸克上传产物</label>
+                <select class="form-select" id="contentProductQuarkArtifact"><option value="pdf" selected>PDF</option><option value="zip">完整 ZIP 包</option></select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="contentProductQuarkFid">夸克目标目录 FID</label>
+                <input class="form-control" id="contentProductQuarkFid" placeholder="留空使用夸克自动上架所选目录">
+              </div>
             </div>
+            <details class="border rounded p-3 mt-3">
+              <summary class="fw-semibold">飞书文档配置（选中飞书输出时使用）</summary>
+              <div class="row g-3 mt-1">
+                <div class="col-md-4"><label class="form-label" for="contentFeishuAppId">App ID</label><input class="form-control" id="contentFeishuAppId" placeholder="cli_xxx"></div>
+                <div class="col-md-4"><label class="form-label" for="contentFeishuAppSecret">App Secret</label><input class="form-control" id="contentFeishuAppSecret" type="password" placeholder="留空保留已保存值"></div>
+                <div class="col-md-4"><label class="form-label" for="contentFeishuFolderToken">目标文件夹 Token</label><input class="form-control" id="contentFeishuFolderToken" placeholder="留空放到云空间默认位置"></div>
+                <div class="col-12"><button class="btn btn-sm btn-outline-primary" type="button" onclick="saveContentProductSettings()">保存飞书/夸克交付配置</button></div>
+              </div>
+            </details>
             <div class="d-flex flex-wrap gap-2 mt-4">
               <button class="btn btn-primary" type="button" id="contentProductGenerateBtn" onclick="generateContentProduct(false)"><i class="bi bi-stars me-1"></i>生成内容包</button>
               <button class="btn btn-danger" type="button" id="contentProductGeneratePublishBtn" onclick="generateContentProduct(true)"><i class="bi bi-cloud-upload me-1"></i>生成并上架</button>
@@ -1347,6 +1390,185 @@
             <button class="btn btn-sm btn-outline-primary" type="button" onclick="loadContentProducts()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
           </div>
           <div class="card-body"><div id="contentProductList" class="table-responsive"><div class="text-muted small">暂无生成记录</div></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 个人 IP 内容工厂 -->
+    <div id="ip-content-studio-section" class="content-section">
+      <div class="content-header">
+        <h2 class="mb-0"><i class="bi bi-person-bounding-box me-2"></i>个人 IP 内容工厂</h2>
+        <p class="text-muted mb-0">把外部文章拆成知识，再用你的身份、口吻和视觉重新创作公众号母稿与多平台版本</p>
+      </div>
+      <div class="content-body">
+        <div class="alert alert-primary border-0 shadow-sm mb-4">
+          <div class="fw-semibold mb-1">这条链路与“链接商品化”相互独立</div>
+          <div class="small">原作者姓名、账号、自我介绍、课程广告、联系方式、粉丝/收入数字、升级提示会在分析阶段隔离；发布稿只使用已核验的知识和你的 IP 档案。</div>
+        </div>
+
+        <div class="row g-4">
+          <div class="col-xl-4">
+            <div class="card h-100 border-primary-subtle">
+              <div class="card-header d-flex justify-content-between align-items-center">
+                <div><h5 class="mb-1">1. 我的 IP</h5><div class="text-muted small">第一人称信息的唯一真值来源</div></div>
+                <button class="btn btn-sm btn-outline-primary" type="button" onclick="newIPProfile()"><i class="bi bi-plus-lg"></i> 新建</button>
+              </div>
+              <div class="card-body">
+                <label class="form-label" for="ipProfileSelect">档案</label>
+                <select class="form-select mb-3" id="ipProfileSelect" onchange="selectIPProfile()"><option value="">新建档案</option></select>
+                <input type="hidden" id="ipProfileId">
+                <div class="row g-3">
+                  <div class="col-6"><label class="form-label" for="ipProfileName">档案名称</label><input class="form-control" id="ipProfileName" placeholder="例如：我的科技号"></div>
+                  <div class="col-6"><label class="form-label" for="ipDisplayName">对外称呼</label><input class="form-control" id="ipDisplayName" placeholder="例如：小林"></div>
+                  <div class="col-12"><label class="form-label" for="ipPositioning">定位</label><input class="form-control" id="ipPositioning" placeholder="例如：帮助普通人用 AI 提升工作效率"></div>
+                  <div class="col-12"><label class="form-label" for="ipAudience">目标读者</label><input class="form-control" id="ipAudience" placeholder="例如：职场新人、个体创业者"></div>
+                  <div class="col-12"><label class="form-label" for="ipTopics">长期主题</label><input class="form-control" id="ipTopics" placeholder="AI 工具, 个人成长, 副业复盘"></div>
+                  <div class="col-12"><label class="form-label" for="ipTone">表达风格</label><input class="form-control" id="ipTone" placeholder="真诚、具体、像朋友聊天，有自己的判断"></div>
+                  <div class="col-12"><label class="form-label" for="ipOpening">常用开场</label><textarea class="form-control" id="ipOpening" rows="2" placeholder="大家好，我是{称呼}。最近我重新学习了……"></textarea></div>
+                  <div class="col-12"><label class="form-label" for="ipClosing">常用结尾</label><textarea class="form-control" id="ipClosing" rows="2" placeholder="如果这篇内容对你有帮助……"></textarea></div>
+                  <div class="col-12"><label class="form-label" for="ipBio">公开简介</label><textarea class="form-control" id="ipBio" rows="2" placeholder="可公开出现在文章末尾的简介"></textarea></div>
+                  <div class="col-12"><label class="form-label" for="ipExperiences">可核验经历（每行一条）</label><textarea class="form-control" id="ipExperiences" rows="4" placeholder="只写真实经历；AI 只允许从这里引用第一人称案例"></textarea></div>
+                  <div class="col-12"><label class="form-label" for="ipForbidden">禁用表达（每行一条）</label><textarea class="form-control" id="ipForbidden" rows="3" placeholder="例如：月入十万\n全网最强"></textarea></div>
+                  <div class="col-12"><label class="form-label" for="ipVisualStyle">IP 视觉设定</label><textarea class="form-control" id="ipVisualStyle" rows="3" placeholder="人物形象、服装、插画风格、固定场景"></textarea></div>
+                  <div class="col-12"><label class="form-label" for="ipBrandColors">品牌色</label><input class="form-control" id="ipBrandColors" placeholder="#4F46E5, #F59E0B"></div>
+                </div>
+                <div class="d-flex gap-2 mt-3">
+                  <button class="btn btn-primary flex-grow-1" type="button" onclick="saveIPProfile()"><i class="bi bi-save me-1"></i>保存档案</button>
+                  <button class="btn btn-outline-danger" id="ipDeleteProfileBtn" type="button" onclick="deleteIPProfile()" title="删除档案"><i class="bi bi-trash"></i></button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-xl-8">
+            <div class="card mb-4 border-primary-subtle">
+              <div class="card-header"><h5 class="mb-1">2. 来源分析</h5><div class="text-muted small">先拆知识、再选角度；不会把原作者个人信息送入创作稿</div></div>
+              <div class="card-body">
+                <div class="row g-3">
+                  <div class="col-12"><label class="form-label" for="ipSourceImport">Chrome 采集内容</label><select class="form-select" id="ipSourceImport" onchange="loadIPSourceImport()"><option value="">手动输入链接/正文</option></select></div>
+                  <div class="col-md-8"><label class="form-label" for="ipSourceUrl">文章链接</label><input type="url" class="form-control" id="ipSourceUrl" placeholder="X 长文、公众号或网页链接"></div>
+                  <div class="col-md-4"><label class="form-label" for="ipSourceAuthor">原作者（用于排除）</label><input class="form-control" id="ipSourceAuthor" placeholder="可留空"></div>
+                  <div class="col-12"><label class="form-label" for="ipSourceTitle">来源标题</label><input class="form-control" id="ipSourceTitle" placeholder="文章标题"></div>
+                  <div class="col-12"><label class="form-label" for="ipSourceText">来源正文</label><textarea class="form-control" id="ipSourceText" rows="10" maxlength="100000" placeholder="可选择 Chrome 采集，或粘贴完整正文"></textarea></div>
+                </div>
+                <button class="btn btn-primary mt-3" id="ipAnalyzeBtn" type="button" onclick="analyzeIPSource()"><i class="bi bi-diagram-3 me-1"></i>拆解知识与污染内容</button>
+                <div class="alert alert-light border mt-3 mb-0 small" id="ipStudioStatus">等待选择 IP 档案和来源</div>
+              </div>
+            </div>
+
+            <div class="card mb-4 d-none" id="ipAnalysisCard">
+              <div class="card-header d-flex justify-content-between align-items-center"><h5 class="mb-0">3. 分析结果与创作角度</h5><span class="badge text-bg-success" id="ipAnalysisCleanBadge">已隔离</span></div>
+              <div class="card-body">
+                <div class="row g-3 mb-3">
+                  <div class="col-lg-7"><div class="border rounded p-3 h-100"><div class="fw-semibold mb-2">保留的知识</div><div id="ipAnalysisKnowledge" class="small" style="white-space:pre-wrap;max-height:320px;overflow:auto"></div></div></div>
+                  <div class="col-lg-5"><div class="border border-danger-subtle rounded p-3 h-100 bg-danger-subtle bg-opacity-10"><div class="fw-semibold text-danger mb-2">已排除的作者/宣传内容</div><div id="ipAnalysisExcluded" class="small" style="max-height:320px;overflow:auto"></div></div></div>
+                </div>
+                <div class="row g-3">
+                  <div class="col-md-5"><label class="form-label" for="ipCreativeAngle">创作角度</label><select class="form-select" id="ipCreativeAngle"></select></div>
+                  <div class="col-md-7"><label class="form-label" for="ipCustomDirection">本次补充建议</label><input class="form-control" id="ipCustomDirection" placeholder="例如：多写普通人如何落地，不要讲太多概念"></div>
+                  <div class="col-12"><label class="form-label d-block">生成平台</label><div class="d-flex flex-wrap gap-3" id="ipPlatformChecks"></div></div>
+                  <div class="col-md-6"><div class="form-check form-switch pt-2"><input class="form-check-input" type="checkbox" id="ipGenerateImages" checked><label class="form-check-label" for="ipGenerateImages">生成全新 IP 配图</label></div></div>
+                  <div class="col-md-3"><label class="form-label" for="ipImageCount">本次生成张数</label><input class="form-control" type="number" id="ipImageCount" min="0" max="8" value="4"></div>
+                  <div class="col-md-3 d-flex align-items-end"><button class="btn btn-success w-100" id="ipGenerateBtn" type="button" onclick="generateIPProject()"><i class="bi bi-stars me-1"></i>生成母稿与变体</button></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-4 border-info-subtle" id="ipVisualLibraryCard">
+          <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div>
+              <h5 class="mb-1"><i class="bi bi-palette2 me-2"></i>视觉 IP 素材库</h5>
+              <div class="text-muted small">固定人物、品牌色、构图规则和参考素材；后续封面与正文配图自动沿用同一视觉指纹</div>
+            </div>
+            <div class="d-flex gap-2 align-items-center">
+              <span class="badge text-bg-info" id="ipVisualFingerprintBadge">请选择 IP 档案</span>
+              <button class="btn btn-sm btn-outline-primary" type="button" onclick="loadIPVisualLibrary()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="alert alert-light border small" id="ipVisualLibraryStatus">保存 IP 档案后即可建立专属视觉素材库。</div>
+            <div class="row g-4">
+              <div class="col-xl-7">
+                <div class="border rounded p-3 h-100">
+                  <div class="fw-semibold mb-3">视觉身份设定</div>
+                  <div class="row g-3">
+                    <div class="col-md-5"><label class="form-label" for="ipKitCharacterName">固定人物/角色名</label><input class="form-control" id="ipKitCharacterName" placeholder="例如：小林 / 戴橙色耳机的青年"></div>
+                    <div class="col-md-7"><label class="form-label" for="ipKitStyleKeywords">统一风格关键词</label><input class="form-control" id="ipKitStyleKeywords" placeholder="扁平杂志插画、柔和颗粒、干净留白"></div>
+                    <div class="col-12"><label class="form-label" for="ipKitCharacterDescription">人物外观与设定</label><textarea class="form-control" id="ipKitCharacterDescription" rows="3" placeholder="年龄气质、发型、脸型、服装、随身物件；每次生图会固定注入"></textarea></div>
+                    <div class="col-12"><label class="form-label" for="ipKitSignatureElements">标志性元素</label><textarea class="form-control" id="ipKitSignatureElements" rows="2" placeholder="例如：橙色耳机、深蓝连帽衫、右下角圆形品牌符号、米白纸张纹理"></textarea></div>
+                    <div class="col-md-6"><label class="form-label" for="ipKitCoverRules">封面规则</label><textarea class="form-control" id="ipKitCoverRules" rows="3" placeholder="主体位置、留白、视觉焦点、是否留标题区"></textarea></div>
+                    <div class="col-md-6"><label class="form-label" for="ipKitInlineRules">正文配图规则</label><textarea class="form-control" id="ipKitInlineRules" rows="3" placeholder="画幅、人物比例、场景复杂度、与段落的关系"></textarea></div>
+                    <div class="col-12"><label class="form-label" for="ipKitPromptTemplate">固定提示词模板</label><textarea class="form-control font-monospace" id="ipKitPromptTemplate" rows="3" placeholder="可写固定镜头语言、材质、线条、光影和输出质量"></textarea></div>
+                    <div class="col-12"><label class="form-label" for="ipKitNegativePrompt">统一排除项</label><textarea class="form-control" id="ipKitNegativePrompt" rows="2" placeholder="不要出现的画风、元素、文字、Logo、畸形细节等"></textarea></div>
+                  </div>
+                  <button class="btn btn-primary mt-3" id="ipSaveVisualKitBtn" type="button" onclick="saveIPVisualKit()"><i class="bi bi-fingerprint me-1"></i>保存视觉指纹</button>
+                </div>
+              </div>
+              <div class="col-xl-5">
+                <div class="border rounded p-3 mb-3">
+                  <div class="fw-semibold mb-3">上传参考素材</div>
+                  <input class="form-control mb-2" type="file" id="ipVisualUploadFiles" accept="image/png,image/jpeg,image/webp" multiple>
+                  <div class="row g-2">
+                    <div class="col-6"><select class="form-select" id="ipVisualUploadType"></select></div>
+                    <div class="col-6"><input class="form-control" id="ipVisualUploadName" placeholder="单图名称（可选）"></div>
+                    <div class="col-12"><input class="form-control" id="ipVisualUploadTags" placeholder="标签：正面, 半身, 日常服装"></div>
+                    <div class="col-12"><textarea class="form-control" id="ipVisualUploadNotes" rows="2" placeholder="连续性说明：哪些外观、配色或构图必须保持"></textarea></div>
+                  </div>
+                  <button class="btn btn-outline-primary w-100 mt-2" type="button" onclick="uploadIPVisualAssets()"><i class="bi bi-cloud-arrow-up me-1"></i>加入素材库</button>
+                </div>
+                <div class="border rounded p-3">
+                  <div class="fw-semibold mb-3">按视觉指纹生成新素材</div>
+                  <textarea class="form-control mb-2" id="ipVisualGeneratePrompt" rows="3" placeholder="例如：角色坐在桌前整理 AI 工作流卡片，适合作为效率主题文章封面"></textarea>
+                  <div class="row g-2">
+                    <div class="col-5"><select class="form-select" id="ipVisualGenerateType"></select></div>
+                    <div class="col-4"><select class="form-select" id="ipVisualGeneratePurpose"><option value="cover">封面图</option><option value="inline">正文配图</option></select></div>
+                    <div class="col-3"><input class="form-control" id="ipVisualGenerateName" placeholder="名称"></div>
+                  </div>
+                  <button class="btn btn-success w-100 mt-2" id="ipVisualGenerateBtn" type="button" onclick="generateIPVisualAsset()"><i class="bi bi-stars me-1"></i>生成并收藏</button>
+                </div>
+              </div>
+            </div>
+            <hr class="my-4">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+              <div><span class="fw-semibold">素材资产</span><span class="text-muted small ms-2" id="ipVisualAssetCount">0 张</span></div>
+              <div class="text-muted small"><i class="bi bi-pin-angle me-1"></i>设为主参考后会优先进入每次生图的连续性约束</div>
+            </div>
+            <div class="row g-3" id="ipVisualAssetGrid"><div class="text-muted small">暂无视觉素材</div></div>
+          </div>
+        </div>
+
+        <div class="card mb-4 d-none" id="ipEditorCard">
+          <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div><h5 class="mb-1">4. 创作工作台</h5><div class="text-muted small" id="ipQualitySummary">等待生成</div></div>
+            <div class="d-flex flex-wrap gap-2">
+              <button class="btn btn-sm btn-primary" type="button" onclick="saveIPProject()"><i class="bi bi-save me-1"></i>保存修改</button>
+              <button class="btn btn-sm btn-outline-secondary" type="button" onclick="copyIPMaster()"><i class="bi bi-clipboard me-1"></i>复制母稿</button>
+              <div class="dropdown"><button class="btn btn-sm btn-outline-primary dropdown-toggle" data-bs-toggle="dropdown"><i class="bi bi-download me-1"></i>导出</button><ul class="dropdown-menu" id="ipExportMenu"></ul></div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="row g-4">
+              <div class="col-lg-8">
+                <label class="form-label" for="ipMasterTitle">文章标题</label><input class="form-control mb-3" id="ipMasterTitle">
+                <label class="form-label" for="ipMasterSummary">摘要</label><textarea class="form-control mb-3" id="ipMasterSummary" rows="2"></textarea>
+                <label class="form-label" for="ipMasterMarkdown">公众号母稿（Markdown，可直接编辑）</label><textarea class="form-control font-monospace" id="ipMasterMarkdown" rows="28"></textarea>
+              </div>
+              <div class="col-lg-4">
+                <div class="border rounded p-3 mb-3"><div class="fw-semibold mb-2">多平台版本</div><select class="form-select mb-2" id="ipVariantSelect" onchange="showIPVariant()"></select><textarea class="form-control font-monospace" id="ipVariantPreview" rows="18"></textarea></div>
+                <div class="border rounded p-3"><div class="fw-semibold mb-2">待确认事实</div><div class="small" id="ipConfirmationItems">无</div></div>
+              </div>
+            </div>
+            <hr class="my-4">
+            <div class="d-flex justify-content-between align-items-center mb-3"><div><h5 class="mb-1">IP 配图库</h5><div class="text-muted small">来源图片仅用于研究，不进入发布稿；每张新图都可附加建议后重生成</div></div></div>
+            <div class="row g-3" id="ipVisualGallery"><div class="text-muted small">暂无配图方案</div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header d-flex justify-content-between align-items-center"><h5 class="mb-0">创作项目</h5><button class="btn btn-sm btn-outline-primary" type="button" onclick="loadIPProjects()"><i class="bi bi-arrow-clockwise"></i> 刷新</button></div>
+          <div class="card-body"><div class="table-responsive" id="ipProjectList"><div class="text-muted small">暂无项目</div></div></div>
         </div>
       </div>
     </div>
