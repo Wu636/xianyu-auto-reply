@@ -7217,10 +7217,10 @@ Cookie数量: {cookie_count}
             return config
 
         masked = dict(config)
-        for field in ('quark_cookie', 'text_api_key', 'image_api_key'):
+        for field in ('quark_cookie', 'text_api_key', 'vision_api_key', 'image_api_key'):
             secret = str(config.get(field) or '').strip()
             masked[f'{field}_configured'] = bool(secret)
-            if secret and field in {'text_api_key', 'image_api_key'}:
+            if secret and field in {'text_api_key', 'vision_api_key', 'image_api_key'}:
                 masked[f'{field}_hint'] = (
                     f"末尾 …{secret[-4:]} · 指纹 {hashlib.sha256(secret.encode('utf-8')).hexdigest()[:8]}"
                 )
@@ -7232,7 +7232,7 @@ Cookie数量: {cookie_count}
         existing = self.get_quark_catalog_settings(user_id, include_secrets=True)
         merged = dict(existing)
         for key, value in (config or {}).items():
-            if key in {'quark_cookie', 'text_api_key', 'image_api_key'} and not str(value or '').strip():
+            if key in {'quark_cookie', 'text_api_key', 'vision_api_key', 'image_api_key'} and not str(value or '').strip():
                 continue
             merged[key] = value
         encrypted = self._encrypt_secret(json.dumps(merged, ensure_ascii=False, default=str))

@@ -62,10 +62,7 @@ let ipStudioBusy = false;
 let quarkCatalogJobTimer = null;
 let quarkFolderPickerStack = [];
 let quarkCatalogPreviewState = null;
-const quarkCatalogSecretEditState = {
-    text_api_key: false,
-    image_api_key: false
-};
+const aiModelSecretEditState = { text: false, vision: false, image: false };
 
 // 订单列表搜索和分页相关变量
 let allOrdersData = []; // 存储所有订单数据
@@ -157,6 +154,9 @@ function showSection(sectionName) {
         break;
     case 'ip-content-studio':
         loadIPContentStudio();
+        break;
+    case 'ai-model-settings':
+        loadAIModelSettings();
         break;
     case 'items':           // 【商品管理菜单】
         loadItems();
@@ -10250,6 +10250,7 @@ const DEFAULT_MENU_ITEMS = [
     { id: 'item-publish', name: '商品发布', icon: 'bi-bag-plus', required: false },
     { id: 'content-products', name: '链接商品化', icon: 'bi-link-45deg', required: false },
     { id: 'ip-content-studio', name: 'IP 内容工厂', icon: 'bi-person-bounding-box', required: false },
+    { id: 'ai-model-settings', name: 'AI 模型配置', icon: 'bi-cpu', required: false },
     { id: 'items', name: '商品管理', icon: 'bi-box-seam', required: false },
     { id: 'orders', name: '订单管理', icon: 'bi-receipt-cutoff', required: false },
     { id: 'auto-reply', name: '自动回复', icon: 'bi-chat-left-text', required: false },
@@ -12574,88 +12575,153 @@ function setQuarkCatalogStatus(message, type = 'light') {
     element.textContent = message;
 }
 
-const QUARK_CATALOG_SECRET_FIELDS = {
-    text_api_key: {
-        inputId: 'quarkTextApiKey',
-        buttonId: 'quarkTextApiKeyEditButton',
-        stateId: 'quarkTextApiKeyState',
-        configuredField: 'text_api_key_configured',
-        hintField: 'text_api_key_hint',
-        label: '文案 API Key'
+// ==================== 全系统通用 AI 模型配置 ====================
+
+const AI_MODEL_SECRET_FIELDS = {
+    text: {
+        inputId: 'aiTextApiKey', buttonId: 'aiTextApiKeyEditButton', stateId: 'aiTextApiKeyState',
+        configuredField: 'text_api_key_configured', hintField: 'text_api_key_hint', label: '文案 API Key'
     },
-    image_api_key: {
-        inputId: 'quarkImageApiKey',
-        buttonId: 'quarkImageApiKeyEditButton',
-        stateId: 'quarkImageApiKeyState',
-        configuredField: 'image_api_key_configured',
-        hintField: 'image_api_key_hint',
-        label: '生图 API Key'
+    vision: {
+        inputId: 'aiVisionApiKey', buttonId: 'aiVisionApiKeyEditButton', stateId: 'aiVisionApiKeyState',
+        configuredField: 'vision_api_key_configured', hintField: 'vision_api_key_hint', label: '识图 API Key',
+        inheritField: 'vision_api_key_inherits_text'
+    },
+    image: {
+        inputId: 'aiImageApiKey', buttonId: 'aiImageApiKeyEditButton', stateId: 'aiImageApiKeyState',
+        configuredField: 'image_api_key_configured', hintField: 'image_api_key_hint', label: '生图 API Key',
+        inheritField: 'image_api_key_inherits_text'
     }
 };
 
-function enableQuarkCatalogSecretEdit(field) {
-    const config = QUARK_CATALOG_SECRET_FIELDS[field];
+function setAIModelSettingsStatus(message, type = 'light') {
+    const element = document.getElementById('aiModelSettingsStatus');
+    if (!element) return;
+    element.className = `alert alert-${type} border mt-3 mb-0`;
+    element.textContent = message;
+}
+
+function enableAIModelSecretEdit(kind) {
+    const config = AI_MODEL_SECRET_FIELDS[kind];
     if (!config) return;
     const input = document.getElementById(config.inputId);
     const button = document.getElementById(config.buttonId);
-    const state = document.getElementById(config.stateId);
     if (!input) return;
-
-    quarkCatalogSecretEditState[field] = true;
+    aiModelSecretEditState[kind] = true;
     input.readOnly = false;
     input.value = '';
     input.placeholder = `请输入新的${config.label}`;
-    if (button) {
-        button.textContent = '编辑中';
-        button.classList.remove('btn-outline-primary');
-        button.classList.add('btn-warning');
-    }
-    if (state) state.textContent = '请输入新 Key，点击“保存配置”后加密保存；未保存前不会替换旧值。';
+    button?.classList.replace('btn-outline-primary', 'btn-warning');
+    if (button) button.textContent = '编辑中';
+    const state = document.getElementById(config.stateId);
+    if (state) state.textContent = '新 Key 会在保存后加密写入；原值在保存前保持有效。';
     window.setTimeout(() => input.focus(), 0);
 }
 
-function lockQuarkCatalogSecretField(field, settings = {}) {
-    const config = QUARK_CATALOG_SECRET_FIELDS[field];
+function lockAIModelSecretField(kind, settings = {}) {
+    const config = AI_MODEL_SECRET_FIELDS[kind];
     if (!config) return;
     const input = document.getElementById(config.inputId);
     const button = document.getElementById(config.buttonId);
     const state = document.getElementById(config.stateId);
     const configured = Boolean(settings[config.configuredField]);
+    const inherited = Boolean(config.inheritField && settings[config.inheritField]);
     const hint = String(settings[config.hintField] || '').trim();
-
-    quarkCatalogSecretEditState[field] = false;
+    aiModelSecretEditState[kind] = false;
     if (input) {
         input.value = '';
         input.readOnly = true;
-        input.placeholder = configured ? '已保存的 Key 不会显示' : `点击“修改”输入${config.label}`;
+        input.placeholder = configured ? 'Key 已加密保存' : `点击“设置”输入${config.label}`;
     }
     if (button) {
-        button.textContent = configured ? '更换' : '设置';
+        button.textContent = configured && !inherited ? '更换' : '设置';
         button.classList.remove('btn-warning');
         button.classList.add('btn-outline-primary');
     }
     if (state) {
-        if (configured) {
-            state.textContent = `已加密保存${hint ? `（${hint}）` : ''}；刷新或重启后继续使用，无需重新输入。`;
-        } else if (field === 'image_api_key') {
-            state.textContent = '尚未单独配置；首次保存时可留空复用文案 Key。';
-        } else {
-            state.textContent = '尚未配置。';
-        }
+        if (inherited) state.textContent = '当前复用文案 API Key；如供应商不同，请单独设置。';
+        else if (configured) state.textContent = `已加密保存${hint ? `（${hint}）` : ''}，刷新与重启后继续生效。`;
+        else if (kind !== 'text') state.textContent = '留空时复用文案 API Key。';
+        else state.textContent = '尚未配置。';
     }
 }
 
-function getEditedQuarkCatalogSecret(field) {
-    const config = QUARK_CATALOG_SECRET_FIELDS[field];
-    if (!config || !quarkCatalogSecretEditState[field]) {
-        return '';
+async function loadAIModelSettings() {
+    if (!document.getElementById('ai-model-settings-section')) return;
+    try {
+        const data = await requestItemPublishJson('/ai-model-settings');
+        const settings = data.settings || {};
+        const setValue = (id, value) => {
+            const element = document.getElementById(id);
+            if (element && value !== undefined && value !== null) element.value = value;
+        };
+        setValue('aiTextBaseUrl', settings.text_base_url || 'https://api.openai.com/v1');
+        setValue('aiTextModel', settings.text_model || 'gpt-5-mini');
+        setValue('aiVisionBaseUrl', settings.vision_base_url || settings.text_base_url || 'https://api.openai.com/v1');
+        setValue('aiVisionModel', settings.vision_model || 'gpt-4o');
+        setValue('aiImageBaseUrl', settings.image_base_url || settings.text_base_url || 'https://api.openai.com/v1');
+        setValue('aiImageModel', settings.image_model || 'gpt-image-1');
+        setValue('aiImageSize', settings.image_size || '1024x1024');
+        Object.keys(AI_MODEL_SECRET_FIELDS).forEach(kind => lockAIModelSecretField(kind, settings));
+        setAIModelSettingsStatus('已读取当前通用配置。修改后可保存，或直接使用对应的连通性测试。', 'light');
+    } catch (error) {
+        console.error('加载 AI 模型配置失败:', error);
+        setAIModelSettingsStatus(error.message || '读取配置失败', 'danger');
     }
+}
 
-    const value = document.getElementById(config.inputId)?.value.trim() || '';
-    if (!value) {
-        throw new Error(`请输入新的${config.label}，或刷新页面取消更换`);
+function getAIModelSettingsForm() {
+    const secretValue = kind => {
+        if (!aiModelSecretEditState[kind]) return '';
+        const value = document.getElementById(AI_MODEL_SECRET_FIELDS[kind].inputId)?.value.trim() || '';
+        if (!value) throw new Error(`请输入新的${AI_MODEL_SECRET_FIELDS[kind].label}，或点击“重新读取”取消编辑`);
+        return value;
+    };
+    return {
+        text_base_url: document.getElementById('aiTextBaseUrl')?.value.trim() || '',
+        text_model: document.getElementById('aiTextModel')?.value.trim() || '',
+        text_api_key: secretValue('text'),
+        vision_base_url: document.getElementById('aiVisionBaseUrl')?.value.trim() || '',
+        vision_model: document.getElementById('aiVisionModel')?.value.trim() || '',
+        vision_api_key: secretValue('vision'),
+        image_base_url: document.getElementById('aiImageBaseUrl')?.value.trim() || '',
+        image_model: document.getElementById('aiImageModel')?.value.trim() || '',
+        image_api_key: secretValue('image'),
+        image_size: document.getElementById('aiImageSize')?.value || '1024x1024'
+    };
+}
+
+async function saveAIModelSettings(showSuccess = true) {
+    try {
+        const data = await requestItemPublishJson('/ai-model-settings', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(getAIModelSettingsForm())
+        });
+        await loadAIModelSettings();
+        if (showSuccess) showToast(data.message || 'AI 模型配置已保存', 'success');
+        return true;
+    } catch (error) {
+        console.error('保存 AI 模型配置失败:', error);
+        setAIModelSettingsStatus(error.message || '保存配置失败', 'danger');
+        showToast(error.message || '保存配置失败', 'danger');
+        return false;
     }
-    return value;
+}
+
+async function testAIModel(kind) {
+    const labels = { text: '文案', vision: '视觉识图', image: '生图' };
+    if (kind === 'image' && !confirm('生图测试会真实调用一次图像生成接口并产生相应额度消耗，确认继续吗？')) return;
+    if (!await saveAIModelSettings(false)) return;
+    setAIModelSettingsStatus(`正在测试${labels[kind] || ''}模型...`, 'info');
+    try {
+        const data = await requestItemPublishJson(`/ai-model-settings/test-${kind}`, { method: 'POST' });
+        const size = data.width && data.height ? `，返回 ${data.width}×${data.height}` : '';
+        setAIModelSettingsStatus(`${data.message || '连接正常'}（${data.model || ''}${size}）`, 'success');
+        showToast(data.message || '模型连接正常', 'success');
+    } catch (error) {
+        setAIModelSettingsStatus(error.message || `${labels[kind] || ''}模型测试失败`, 'danger');
+        showToast(error.message || '模型测试失败', 'danger');
+    }
 }
 
 async function loadQuarkCatalogSettings() {
@@ -12672,10 +12738,6 @@ async function loadQuarkCatalogSettings() {
         setValue('quarkCatalogRootName', settings.root_folder_name || (settings.root_fid === '0' ? '根目录' : '所选夸克文件夹'));
         setValue('quarkCatalogScope', settings.catalog_scope || 'child_folders');
         setValue('quarkCatalogMaxItems', settings.max_items_per_run || 5);
-        setValue('quarkTextBaseUrl', settings.text_base_url || 'https://api.openai.com/v1');
-        setValue('quarkTextModel', settings.text_model || 'gpt-5-mini');
-        setValue('quarkImageBaseUrl', settings.image_base_url || 'https://api.openai.com/v1');
-        setValue('quarkImageModel', settings.image_model || 'gpt-image-1');
         setValue('quarkCatalogPrice', settings.default_price ?? '');
         setValue('quarkCatalogOriginalPrice', settings.default_original_price ?? '');
         setValue('quarkCatalogCategory', settings.category_hint || '');
@@ -12695,8 +12757,6 @@ async function loadQuarkCatalogSettings() {
                 ? 'Cookie 已加密保存；留空即可保留原值'
                 : '尚未配置 Cookie';
         }
-        lockQuarkCatalogSecretField('text_api_key', settings);
-        lockQuarkCatalogSecretField('image_api_key', settings);
     } catch (error) {
         console.error('加载夸克自动上架配置失败:', error);
         setQuarkCatalogStatus(error.message || '加载配置失败', 'danger');
@@ -12710,12 +12770,6 @@ function getQuarkCatalogSettingsForm() {
         root_fid: document.getElementById('quarkCatalogRootFid')?.value.trim() || '0',
         root_folder_name: document.getElementById('quarkCatalogRootName')?.value.trim() || '根目录',
         catalog_scope: document.getElementById('quarkCatalogScope')?.value || 'child_folders',
-        text_base_url: document.getElementById('quarkTextBaseUrl')?.value.trim() || '',
-        text_api_key: getEditedQuarkCatalogSecret('text_api_key'),
-        text_model: document.getElementById('quarkTextModel')?.value.trim() || '',
-        image_base_url: document.getElementById('quarkImageBaseUrl')?.value.trim() || '',
-        image_api_key: getEditedQuarkCatalogSecret('image_api_key'),
-        image_model: document.getElementById('quarkImageModel')?.value.trim() || '',
         default_price: parseOptionalPublishNumber(document.getElementById('quarkCatalogPrice')?.value, '默认售价'),
         default_original_price: parseOptionalPublishNumber(document.getElementById('quarkCatalogOriginalPrice')?.value, '默认原价'),
         category_hint: document.getElementById('quarkCatalogCategory')?.value.trim() || '',
@@ -12741,8 +12795,6 @@ async function saveQuarkCatalogSettings(showSuccess = true) {
             body: JSON.stringify(payload)
         });
         document.getElementById('quarkCatalogCookie').value = '';
-        document.getElementById('quarkTextApiKey').value = '';
-        document.getElementById('quarkImageApiKey').value = '';
         await loadQuarkCatalogSettings();
         if (showSuccess) showToast(data.message || '夸克自动上架配置已保存', 'success');
         return true;
