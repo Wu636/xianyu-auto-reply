@@ -1467,9 +1467,10 @@
                   <div class="col-md-5"><label class="form-label" for="ipCreativeAngle">创作角度</label><select class="form-select" id="ipCreativeAngle"></select></div>
                   <div class="col-md-7"><label class="form-label" for="ipCustomDirection">本次补充建议</label><input class="form-control" id="ipCustomDirection" placeholder="例如：多写普通人如何落地，不要讲太多概念"></div>
                   <div class="col-12"><label class="form-label d-block">生成平台</label><div class="d-flex flex-wrap gap-3" id="ipPlatformChecks"></div></div>
-                  <div class="col-md-6"><div class="form-check form-switch pt-2"><input class="form-check-input" type="checkbox" id="ipGenerateImages" checked><label class="form-check-label" for="ipGenerateImages">生成全新 IP 配图</label></div></div>
-                  <div class="col-md-3"><label class="form-label" for="ipImageCount">本次生成张数</label><input class="form-control" type="number" id="ipImageCount" min="0" max="8" value="4"></div>
-                  <div class="col-md-3 d-flex align-items-end"><button class="btn btn-success w-100" id="ipGenerateBtn" type="button" onclick="generateIPProject()"><i class="bi bi-stars me-1"></i>生成母稿与变体</button></div>
+                  <div class="col-md-6"><label class="form-label" for="ipImageStrategy">来源配图策略</label><select class="form-select" id="ipImageStrategy"><option value="smart_mix">智能混合（推荐）</option><option value="ip_original">全部使用原创 IP 配图</option><option value="necessary_original">仅保留必要原图</option><option value="keep_all">保留全部原图（自有或已获许可）</option></select><div class="form-text">智能模式会识别界面、步骤和数据图，生成后仍可逐张审核。</div></div>
+                  <div class="col-md-3"><div class="form-check form-switch pt-4 mt-2"><input class="form-check-input" type="checkbox" id="ipGenerateImages" checked><label class="form-check-label" for="ipGenerateImages">生成原创 IP 配图</label></div></div>
+                  <div class="col-md-3"><label class="form-label" for="ipImageCount">原创图张数</label><input class="form-control" type="number" id="ipImageCount" min="0" max="8" value="4"></div>
+                  <div class="col-12"><button class="btn btn-success" id="ipGenerateBtn" type="button" onclick="generateIPProject()"><i class="bi bi-stars me-1"></i>生成母稿与变体</button></div>
                 </div>
               </div>
             </div>
@@ -1561,7 +1562,7 @@
               </div>
             </div>
             <hr class="my-4">
-            <div class="d-flex justify-content-between align-items-center mb-3"><div><h5 class="mb-1">IP 配图库</h5><div class="text-muted small">来源图片仅用于研究，不进入发布稿；每张新图都可附加建议后重生成</div></div></div>
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3"><div><h5 class="mb-1">文章配图审核</h5><div class="text-muted small">原创 IP 图可重生成；来源图可选择保留原图、改用 IP 新图或不使用，并指定插入章节与出处说明。</div><div class="small text-primary mt-1" id="ipSourceVisualSummary"></div></div><button class="btn btn-sm btn-outline-success d-none" id="ipSaveSourceReviewsBtn" type="button" onclick="saveIPSourceVisualReviews()"><i class="bi bi-check2-square me-1"></i>保存来源图审核并重新导出</button></div>
             <div class="row g-3" id="ipVisualGallery"><div class="text-muted small">暂无配图方案</div></div>
           </div>
         </div>

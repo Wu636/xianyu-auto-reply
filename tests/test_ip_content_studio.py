@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import tempfile
 import unittest
 import zipfile
@@ -11,10 +12,14 @@ from pypdf import PdfReader
 from utils.ip_content_studio import (
     assess_originality,
     build_generation_prompts,
+    build_source_image_review_prompts,
     build_visual_identity_prompt,
+    compose_master_with_visuals,
     markdown_to_wechat_html,
     normalize_analysis,
+    normalize_source_image_review,
     preclean_source_text,
+    save_source_visual_assets,
     save_visual_asset,
     write_project_package,
 )
@@ -128,6 +133,77 @@ class IPContentStudioTests(unittest.TestCase):
         self.assertIn("发型和眼镜形状保持一致", first)
         self.assertIn("人物居左", first)
         self.assertIn("平台Logo", first)
+
+    def test_source_images_are_reviewed_and_inserted_near_matching_section(self):
+        markdown = """# 模型选择指南
+
+## 追求质量时怎么选
+
+质量优先时关注模型能力和参数。
+
+## 追求速度时怎么选
+
+批量预览时优先关注响应速度。
+"""
+        images = [
+            {"filename": "settings.jpg", "data": _jpeg_data(), "width": 1200, "height": 675, "alt": "模型设置界面"},
+            {"filename": "promo.jpg", "data": _jpeg_data(), "width": 1200, "height": 675, "alt": "课程宣传"},
+        ]
+        system, user = build_source_image_review_prompts(
+            source_title="模型选择", source_url="https://example.com/source",
+            master_markdown=markdown, source_images=images, image_strategy="smart_mix",
+        )
+        self.assertIn("软件界面", system)
+        self.assertIn("追求质量时怎么选", user)
+        decisions = normalize_source_image_review({"images": [
+            {
+                "index": 1, "classification": "interface", "recommended_mode": "use_original",
+                "reason": "界面参数有助于核对步骤", "insert_after_heading": "追求质量时怎么选",
+                "caption": "模型设置界面示例", "sensitive_notes": "遮挡账号信息",
+            },
+            {
+                "index": 2, "classification": "promotion", "recommended_mode": "use_original",
+                "reason": "原作者课程宣传", "insert_after_heading": "追求速度时怎么选",
+                "caption": "宣传图",
+            },
+        ]}, images, markdown, "smart_mix")
+        self.assertEqual(decisions[0]["use_mode"], "use_original")
+        self.assertEqual(decisions[1]["use_mode"], "omit")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir) / "9"
+            visuals = save_source_visual_assets(
+                project_dir, images, decisions,
+                article_source_url="https://example.com/source", source_author="原作者",
+            )
+            composed = compose_master_with_visuals(markdown, visuals)
+            heading_offset = composed.index("## 追求质量时怎么选")
+            image_offset = composed.index("![模型设置界面示例]")
+            paragraph_offset = composed.index("质量优先时关注")
+            self.assertLess(heading_offset, image_offset)
+            self.assertLess(image_offset, paragraph_offset)
+            self.assertIn("查看原文", composed)
+            self.assertNotIn("宣传图](", composed)
+            self.assertTrue(Path(visuals[0]["path"]).is_file())
+            project = {
+                "title": "模型选择指南",
+                "summary": "按需求选择模型。",
+                "master_markdown": markdown,
+                "variants": {},
+                "visuals": visuals,
+                "analysis": {"core_thesis": "模型选择"},
+                "quality": {"originality_score": 90, "passed": True},
+            }
+            package_paths = write_project_package(Path(temp_dir), 9, project, self.profile)
+            manifest = json.loads((project_dir / "manifest.json").read_text(encoding="utf-8"))
+            review = json.loads((project_dir / "source-image-review.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["original_source_images_reused"])
+            self.assertEqual(manifest["source_image_count"], 2)
+            self.assertEqual(len(review), 2)
+            self.assertNotIn("path", review[0])
+            with zipfile.ZipFile(package_paths["zip"]) as archive:
+                names = set(archive.namelist())
+                self.assertIn("ip-content-9/source-image-review.json", names)
+                self.assertIn("ip-content-9/assets/source-1.jpg", names)
 
     def test_exports_self_contained_html_docx_pdf_and_zip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
