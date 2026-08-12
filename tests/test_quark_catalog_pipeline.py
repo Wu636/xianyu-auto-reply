@@ -178,6 +178,21 @@ class CatalogAIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen['host'], 'vision.example')
         self.assertEqual(seen['payload']['model'], 'vision-model')
 
+    async def test_multimodal_timeout_is_reported_as_catalog_error(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout('provider timed out', request=request)
+
+        async with CatalogAIClient(
+            text_base_url='https://text.example/v1', text_api_key='text-key', text_model='text-model',
+            vision_base_url='https://vision.example/v1', vision_api_key='vision-key', vision_model='vision-model',
+            image_base_url='https://image.example/v1', image_api_key='image-key', image_model='image-model',
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with self.assertRaisesRegex(RuntimeError, '识图模型请求超时'):
+                await client.generate_json_with_images(
+                    '只输出 JSON', '看图', ['https://example.test/test.png']
+                )
+
     async def test_generates_with_real_reference_image(self):
         image_b64 = _tiny_png_base64()
         calls = []
