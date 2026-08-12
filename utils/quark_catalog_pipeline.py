@@ -802,7 +802,16 @@ class CatalogAIClient:
         }
         if max_tokens:
             payload["max_tokens"] = int(max_tokens)
-        response = await self._client.post(endpoint, headers=headers, json=payload)
+        try:
+            response = await self._client.post(endpoint, headers=headers, json=payload)
+        except httpx.TimeoutException as exc:
+            raise CatalogAIError(
+                f"文案模型请求超时（{self.text_model}），请稍后重试或切换供应商线路"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise CatalogAIError(
+                f"文案模型连接异常（{self.text_model}）：{exc.__class__.__name__}"
+            ) from exc
         if response.status_code in {400, 422} and any(
             marker in response.text.lower()
             for marker in ("response_format", "temperature", "max_tokens", "unsupported parameter")
@@ -810,7 +819,16 @@ class CatalogAIClient:
             payload.pop("response_format", None)
             payload.pop("temperature", None)
             payload.pop("max_tokens", None)
-            response = await self._client.post(endpoint, headers=headers, json=payload)
+            try:
+                response = await self._client.post(endpoint, headers=headers, json=payload)
+            except httpx.TimeoutException as exc:
+                raise CatalogAIError(
+                    f"文案模型请求超时（{self.text_model}），请稍后重试或切换供应商线路"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise CatalogAIError(
+                    f"文案模型连接异常（{self.text_model}）：{exc.__class__.__name__}"
+                ) from exc
         if response.is_error:
             raise CatalogAIError(f"文案生成失败: HTTP {response.status_code} {response.text[:500]}")
         try:
@@ -863,7 +881,16 @@ class CatalogAIClient:
         }
         if max_tokens:
             payload["max_tokens"] = int(max_tokens)
-        response = await self._client.post(endpoint, headers=headers, json=payload)
+        try:
+            response = await self._client.post(endpoint, headers=headers, json=payload)
+        except httpx.TimeoutException as exc:
+            raise CatalogAIError(
+                f"识图模型请求超时（{self.vision_model}），请稍后重试；云雾用户可换一条当前空闲的视觉模型线路"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise CatalogAIError(
+                f"识图模型连接异常（{self.vision_model}）：{exc.__class__.__name__}"
+            ) from exc
         if response.status_code in {400, 422} and any(
             marker in response.text.lower()
             for marker in ("response_format", "temperature", "max_tokens", "unsupported parameter")
@@ -871,7 +898,16 @@ class CatalogAIClient:
             payload.pop("response_format", None)
             payload.pop("temperature", None)
             payload.pop("max_tokens", None)
-            response = await self._client.post(endpoint, headers=headers, json=payload)
+            try:
+                response = await self._client.post(endpoint, headers=headers, json=payload)
+            except httpx.TimeoutException as exc:
+                raise CatalogAIError(
+                    f"识图模型请求超时（{self.vision_model}），请稍后重试；云雾用户可换一条当前空闲的视觉模型线路"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise CatalogAIError(
+                    f"识图模型连接异常（{self.vision_model}）：{exc.__class__.__name__}"
+                ) from exc
         if response.is_error:
             raise CatalogAIError(
                 f"来源图片识别未完成: HTTP {response.status_code} {response.text[:500]}"

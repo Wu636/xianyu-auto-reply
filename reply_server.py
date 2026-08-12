@@ -11776,10 +11776,11 @@ async def test_ai_vision_model(current_user: Dict[str, Any] = Depends(get_curren
     }.items() if not str(settings.get(key) or '').strip()]
     if missing:
         raise HTTPException(status_code=400, detail=f"请先配置：{'、'.join(missing)}")
-    test_png = (
-        'data:image/png;base64,'
-        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nxoAAAAASUVORK5CYII='
-    )
+    # Keep this on the regular ``image_url`` path.  Some OpenAI-compatible
+    # providers (notably Yunwu) expose base64 vision through a separate route;
+    # sending a data URL to their normal non-stream endpoint can hang until the
+    # client timeout even though public image URLs work correctly.
+    test_image_url = 'https://lsky.zhongzhuan.chat/i/2024/10/17/6711068a14527.png'
     try:
         async with CatalogAIClient(
             text_base_url=settings['text_base_url'], text_api_key=settings['text_api_key'],
@@ -11791,10 +11792,18 @@ async def test_ai_vision_model(current_user: Dict[str, Any] = Depends(get_curren
             result = await ai_client.generate_json_with_images(
                 '你是视觉 API 连通性检测助手，只输出 JSON。',
                 '查看测试图片并返回 {"ok": true, "message": "识图模型连接正常"}。',
-                [test_png], temperature=0.1, max_tokens=300,
+                [test_image_url], temperature=0.1, max_tokens=300,
             )
     except CatalogAIError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            f"{get_user_log_prefix(current_user)} 识图模型测试异常: {mask_sensitive_text(exc)}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"识图模型测试连接异常：{exc.__class__.__name__}，请稍后重试",
+        ) from exc
     return {'success': True, 'message': str(result.get('message') or '识图模型连接正常'), 'model': settings['vision_model']}
 
 
