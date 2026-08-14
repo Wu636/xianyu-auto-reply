@@ -8,7 +8,6 @@ import hashlib
 import html
 import json
 import re
-import shutil
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -791,12 +790,3 @@ def write_project_package(base_dir: Path, project_id: int, project: Dict[str, An
         "docx": str(project_dir / "article.docx"),
         "pdf": str(project_dir / "article.pdf"),
     }
-
-
-def remove_project_package(project: Dict[str, Any]) -> None:
-    directory = Path(str(project.get("package_dir") or ""))
-    archive = Path(str(project.get("package_zip") or ""))
-    if directory.is_dir():
-        shutil.rmtree(directory)
-    if archive.is_file():
-        archive.unlink()

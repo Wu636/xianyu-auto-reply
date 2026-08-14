@@ -22,6 +22,7 @@ ESSENTIAL_FILES = (
     "static/js/app.js",
     "utils/ip_content_studio.py",
     "utils/content_productizer.py",
+    "utils/safe_file_cleanup.py",
 )
 EXCLUDED_PARTS = {
     ".git", "venv", ".venv", "__pycache__", ".playwright-browsers",

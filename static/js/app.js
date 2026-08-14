@@ -12404,7 +12404,7 @@ async function openIPProject(projectId) {
 }
 
 async function deleteIPProject(projectId) {
-    if (!confirm('确定删除这个创作项目及全部本地导出和配图吗？')) return;
+    if (!confirm('确定删除这个创作项目吗？本地导出和配图会移入系统回收站，不会直接清空磁盘文件。')) return;
     try {
         await requestItemPublishJson(`/ip-content-studio/projects/${projectId}`, {method:'DELETE'});
         if (Number(ipCurrentProject?.id) === Number(projectId)) {

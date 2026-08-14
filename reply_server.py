@@ -75,10 +75,14 @@ from utils.ip_content_studio import (
     normalize_generation,
     normalize_source_image_review,
     preclean_source_text,
-    remove_project_package,
     save_source_visual_assets,
     save_visual_asset,
     write_project_package,
+)
+from utils.safe_file_cleanup import (
+    UnsafeCleanupPath,
+    quarantine_export_package,
+    restore_quarantined_paths,
 )
 from utils.feishu_document import FeishuDocumentClient, FeishuDocumentError
 from utils.time_utils import (
@@ -13722,13 +13726,27 @@ def download_ip_content_project(project_id: int, format: str = 'zip', current_us
 
 @app.delete('/ip-content-studio/projects/{project_id}')
 def delete_ip_content_project(project_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
-    project = db_manager.get_ip_content_project(project_id, current_user['user_id'])
+    user_id = int(current_user['user_id'])
+    project = db_manager.get_ip_content_project(project_id, user_id)
     if not project:
         raise HTTPException(status_code=404, detail='IP 创作项目不存在')
-    if not db_manager.delete_ip_content_project(project_id, current_user['user_id']):
+    try:
+        quarantined = quarantine_export_package(
+            project, kind='ip_content_studio', record_id=project_id, user_id=user_id
+        )
+    except UnsafeCleanupPath as exc:
+        logger.error(f'阻止危险的 IP 项目清理: project_id={project_id}: {exc}')
+        raise HTTPException(status_code=409, detail=f'本地导出路径校验失败，项目未删除：{exc}') from exc
+    except Exception as exc:
+        logger.exception(f'IP 项目导出移入回收站失败: project_id={project_id}')
+        raise HTTPException(status_code=500, detail=f'本地导出移入回收站失败，项目未删除：{exc}') from exc
+    if not db_manager.delete_ip_content_project(project_id, user_id):
+        restore_quarantined_paths(quarantined)
         raise HTTPException(status_code=500, detail='删除 IP 创作项目失败')
-    remove_project_package(project)
-    return {'success': True, 'message': '创作项目和本地导出已删除'}
+    return {
+        'success': True,
+        'message': '创作项目已删除，本地导出已移入回收站' if quarantined else '创作项目已删除',
+    }
 
 
 @app.get('/content-products')
@@ -13830,22 +13848,27 @@ def update_content_product(
 
 @app.delete('/content-products/{product_id}')
 def delete_content_product(product_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
-    product = db_manager.get_content_product(product_id, current_user['user_id'])
+    user_id = int(current_user['user_id'])
+    product = db_manager.get_content_product(product_id, user_id)
     if not product:
         raise HTTPException(status_code=404, detail='内容商品不存在')
-    if not db_manager.delete_content_product(product_id, current_user['user_id']):
+    try:
+        quarantined = quarantine_export_package(
+            product, kind='content_products', record_id=product_id, user_id=user_id
+        )
+    except UnsafeCleanupPath as exc:
+        logger.error(f'阻止危险的内容商品清理: product_id={product_id}: {exc}')
+        raise HTTPException(status_code=409, detail=f'本地导出路径校验失败，商品未删除：{exc}') from exc
+    except Exception as exc:
+        logger.exception(f'内容商品导出移入回收站失败: product_id={product_id}')
+        raise HTTPException(status_code=500, detail=f'本地导出移入回收站失败，商品未删除：{exc}') from exc
+    if not db_manager.delete_content_product(product_id, user_id):
+        restore_quarantined_paths(quarantined)
         raise HTTPException(status_code=500, detail='删除内容商品失败')
-    for candidate in (product.get('package_dir'), product.get('package_zip')):
-        if candidate:
-            path = Path(str(candidate))
-            try:
-                if path.is_dir():
-                    shutil.rmtree(path)
-                elif path.is_file():
-                    path.unlink()
-            except OSError as exc:
-                logger.warning(f'清理内容包文件失败: {path}: {exc}')
-    return {'success': True, 'message': '内容商品已删除'}
+    return {
+        'success': True,
+        'message': '内容商品已删除，本地导出已移入回收站' if quarantined else '内容商品已删除',
+    }
 
 
 @app.get('/content-products/{product_id}/download')

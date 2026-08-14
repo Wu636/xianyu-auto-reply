@@ -555,6 +555,7 @@ debug_*.py
 !tests/test_quark_catalog_pipeline.py
 !tests/test_ip_content_studio.py
 !tests/test_recovery_safety.py
+!tests/test_safe_file_cleanup.py
 
 # 数据导出文件（避免提交用户数据）
 export_*.xlsx
