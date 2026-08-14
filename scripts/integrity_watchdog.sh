@@ -11,6 +11,7 @@ ESSENTIAL=(
   "$PROJECT_DIR/db_manager.py"
   "$PROJECT_DIR/static/index.html"
   "$PROJECT_DIR/static/js/app.js"
+  "$PROJECT_DIR/utils/safe_file_cleanup.py"
 )
 
 while true; do
